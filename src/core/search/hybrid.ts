@@ -15,7 +15,7 @@ import type { SearchResult, SearchOpts, HybridSearchMeta } from '../types.ts';
 import { embed, embedQuery } from '../embedding.ts';
 import { dedupResults } from './dedup.ts';
 import { applyReranker } from './rerank.ts';
-import { autoDetectDetail, classifyQuery } from './query-intent.ts';
+import { autoDetectDetail, classifyQuery, isAmbiguousModalityQuery } from './query-intent.ts';
 import { expandAnchors, hydrateChunks } from './two-pass.ts';
 import { enforceTokenBudget } from './token-budget.ts';
 import { recordSearchTelemetry } from './telemetry.ts';
@@ -406,6 +406,7 @@ export async function hybridSearch(
   // undefined so it doesn't reach the modality branch directly. Resolution:
   //   explicit opts.crossModal ('text'|'image'|'both') wins
   //   else suggestions.suggestedModality (regex-driven)
+  //   else (Commit 4) opt-in LLM tie-break for genuinely ambiguous queries
   //   else 'text' (default)
   //
   // D9 mode-bundle override matrix: when effectiveModality === 'image',
@@ -416,9 +417,32 @@ export async function hybridSearch(
   // Phase 3 (D8): when search.unified_multimodal is true, ALL queries
   // route through the multimodal model + embedding_multimodal column,
   // regardless of detected modality.
+  //
+  // Commit 4 (LLM intent escalation): when search.cross_modal.llm_intent
+  // is true AND regex returned 'text' AND isAmbiguousModalityQuery fires,
+  // await a Haiku tie-break. Fail-open to regex result on any error.
   const explicitModality =
     opts?.crossModal && opts.crossModal !== 'auto' ? opts.crossModal : undefined;
-  const effectiveModality = explicitModality ?? suggestions.suggestedModality ?? 'text';
+  let regexModality = explicitModality ?? suggestions.suggestedModality ?? 'text';
+  // LLM tie-break fires ONLY when:
+  //   - no explicit per-call override
+  //   - regex returned 'text' (not confident image/both)
+  //   - operator opted in via search.cross_modal.llm_intent
+  //   - isAmbiguousModalityQuery says the query is genuinely ambiguous
+  if (
+    explicitModality === undefined &&
+    regexModality === 'text' &&
+    resolvedMode.cross_modal_llm_intent &&
+    isAmbiguousModalityQuery(query)
+  ) {
+    try {
+      const { classifyModalityWithLLM } = await import('./llm-intent.ts');
+      regexModality = await classifyModalityWithLLM(query, 'text');
+    } catch {
+      // Fail-open: regex result stands.
+    }
+  }
+  const effectiveModality = regexModality;
   const unifiedRouting = resolvedMode.unified_multimodal === true;
 
   // Determine query variants (optionally with expansion)
