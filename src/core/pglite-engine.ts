@@ -1239,10 +1239,22 @@ export class PGLiteEngine implements BrainEngine {
     // multimodal column populated by importImageFile. Image-similarity
     // queries pass embeddingColumn='embedding_image' AND a 1024-dim vector
     // produced by gateway.embedMultimodal — must match the column dim.
-    const col = opts?.embeddingColumn === 'embedding_image' ? 'embedding_image' : 'embedding';
-    // Image rows live in modality='image'; text/code in 'text'. Restrict
-    // to the modality matching the column to avoid cross-mode dim leaks.
-    const modalityFilter = col === 'embedding_image' ? `AND cc.modality = 'image'` : `AND cc.modality = 'text'`;
+    //
+    // v0.36 (Phase 3): 'embedding_multimodal' targets the unified column
+    // populated by `gbrain reindex --multimodal`. No modality filter —
+    // the column itself is the filter (only re-embedded rows have non-NULL).
+    let col: 'embedding' | 'embedding_image' | 'embedding_multimodal';
+    let modalityFilter: string;
+    if (opts?.embeddingColumn === 'embedding_image') {
+      col = 'embedding_image';
+      modalityFilter = `AND cc.modality = 'image'`;
+    } else if (opts?.embeddingColumn === 'embedding_multimodal') {
+      col = 'embedding_multimodal';
+      modalityFilter = '';
+    } else {
+      col = 'embedding';
+      modalityFilter = `AND cc.modality = 'text'`;
+    }
 
     const { rows } = await this.db.query(
       `WITH hnsw_candidates AS (

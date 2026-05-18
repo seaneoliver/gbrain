@@ -1856,6 +1856,83 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     });
   }
 
+  // v0.36 Phase 3 — unified_multimodal coverage (D21 source-aware).
+  //
+  // Only meaningful when search.unified_multimodal is on. Reports the
+  // percentage of content_chunks with embedding_multimodal populated.
+  // Source-aware: a global 95% can hide 0% coverage for a specific source.
+  progress.heartbeat('unified_multimodal_coverage');
+  try {
+    const unifiedFlag = await engine.getConfig('search.unified_multimodal').catch(() => null);
+    const unifiedOnlyFlag = await engine.getConfig('search.unified_multimodal_only').catch(() => null);
+    const unifiedOn = unifiedFlag === 'true' || unifiedFlag === '1';
+    const unifiedOnlyOn = unifiedOnlyFlag === 'true' || unifiedOnlyFlag === '1';
+
+    if (!unifiedOn) {
+      checks.push({
+        name: 'unified_multimodal_coverage',
+        status: 'ok',
+        message: 'search.unified_multimodal is off; coverage check N/A',
+      });
+    } else {
+      // D21 source-aware: report per-source coverage so multi-source brains
+      // can't hide 0% on one source behind a high global average.
+      const rows = await engine.executeRaw<{ source_id: string | null; total: string; covered: string }>(
+        `SELECT
+           COALESCE(p.source_id, 'default') AS source_id,
+           COUNT(*)::text AS total,
+           SUM(CASE WHEN cc.embedding_multimodal IS NOT NULL THEN 1 ELSE 0 END)::text AS covered
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+         GROUP BY p.source_id`,
+      );
+      const perSource = rows.map(r => ({
+        source: r.source_id || 'default',
+        total: parseInt(String(r.total), 10),
+        covered: parseInt(String(r.covered), 10),
+      }));
+      const lowestCoverage = perSource.reduce(
+        (acc, r) => Math.min(acc, r.total > 0 ? r.covered / r.total : 1),
+        1,
+      );
+      const summary = perSource.map(r => {
+        const pct = r.total > 0 ? Math.round((r.covered / r.total) * 100) : 0;
+        return `${r.source}:${pct}%`;
+      }).join(', ');
+
+      if (unifiedOnlyOn && lowestCoverage < 0.99) {
+        checks.push({
+          name: 'unified_multimodal_coverage',
+          status: 'fail',
+          message:
+            `unified_multimodal_only is ON but lowest source coverage is ${(lowestCoverage * 100).toFixed(1)}% (${summary}). ` +
+            `Run \`gbrain reindex --multimodal\` to bring coverage to 99%+ or disable strict mode.`,
+        });
+      } else if (lowestCoverage < 0.95) {
+        checks.push({
+          name: 'unified_multimodal_coverage',
+          status: 'warn',
+          message:
+            `unified_multimodal is on but lowest source coverage is ${(lowestCoverage * 100).toFixed(1)}% (${summary}). ` +
+            `Run \`gbrain reindex --multimodal\` to fill the gap.`,
+        });
+      } else {
+        checks.push({
+          name: 'unified_multimodal_coverage',
+          status: 'ok',
+          message: `unified_multimodal coverage: ${summary}`,
+        });
+      }
+    }
+  } catch {
+    // Column probably not present (pre-v0.36 brain pre-migration); skip silently.
+    checks.push({
+      name: 'unified_multimodal_coverage',
+      status: 'ok',
+      message: 'embedding_multimodal column not present yet; skipped',
+    });
+  }
+
   // 11. Markdown body completeness (v0.12.3 reliability wave).
   // v0.12.0's splitBody ate everything after the first `---` horizontal rule,
   // truncating wiki-style pages. Heuristic: pages whose body is <30% of the

@@ -78,9 +78,9 @@ describe('search_by_image op — D18 remote image_path ban', () => {
     const err = await op().handler(
       { engine, remote: true, auth: { token: 't', clientId: 'c1', scopes: ['read'] } } as any,
       { image_path: path },
-    ).catch((e: any) => e);
+    ).catch((e: any) => e as Error);
     expect(err).toBeInstanceOf(Error);
-    expect(err.message).toContain('permission_denied');
+    expect((err as Error).message).toContain('permission_denied');
   });
 
   test('accepts image_path when ctx.remote=false (local CLI)', async () => {
@@ -99,9 +99,9 @@ describe('search_by_image op — input validation', () => {
     const err = await op().handler(
       { engine, remote: false } as any,
       {},
-    ).catch((e: any) => e);
+    ).catch((e: any) => e as Error);
     expect(err).toBeInstanceOf(Error);
-    expect(err.message).toMatch(/image_path|image_url|image_data/);
+    expect((err as Error).message).toMatch(/image_path|image_url|image_data/);
   });
 
   test('rejects multiple inputs together', async () => {
@@ -110,9 +110,9 @@ describe('search_by_image op — input validation', () => {
     const err = await op().handler(
       { engine, remote: false } as any,
       { image_path: path, image_data: PNG_BYTES.toString('base64') },
-    ).catch((e: any) => e);
+    ).catch((e: any) => e as Error);
     expect(err).toBeInstanceOf(Error);
-    expect(err.message).toMatch(/only one of/);
+    expect((err as Error).message).toMatch(/only one of/);
   });
 });
 
@@ -133,9 +133,9 @@ describe('search_by_image op — D23-#6 spend cap', () => {
     const err = await op().handler(
       { engine, remote: true, auth: { token: 't', clientId: 'client_a', scopes: ['read'] } } as any,
       { image_data: PNG_BYTES.toString('base64') },
-    ).catch((e: any) => e);
+    ).catch((e: any) => e as Error);
     expect(err).toBeInstanceOf(Error);
-    expect(err.message).toContain('Daily Voyage spend cap reached');
+    expect((err as Error).message).toContain('Daily Voyage spend cap reached');
   });
 
   test('allows remote call when under budget', async () => {

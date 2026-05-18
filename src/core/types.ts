@@ -505,8 +505,13 @@ export interface SearchOpts {
    * may live in different dim spaces (e.g. OpenAI 1536 + Voyage 1024)
    * which is why the dual-column schema landed in v0.27.1. searchKeyword
    * is unaffected — modality filtering on the keyword path is independent.
+   *
+   * v0.36 (Phase 3 D20): 'embedding_multimodal' targets the unified
+   * 1024d Voyage multimodal-3 column. Populated by `gbrain reindex
+   * --multimodal`. When `search.unified_multimodal: true`, hybridSearch
+   * routes all queries through this column.
    */
-  embeddingColumn?: 'embedding' | 'embedding_image';
+  embeddingColumn?: 'embedding' | 'embedding_image' | 'embedding_multimodal';
   /**
    * @deprecated v0.29.1: use `since` instead. Removed in v0.30.
    * v0.27.0: filter results to pages updated/created after this date. ISO-8601 string.

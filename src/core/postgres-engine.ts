@@ -1244,8 +1244,22 @@ export class PostgresEngine implements BrainEngine {
     const visibilityClause = buildVisibilityClause('p', 's');
 
     // v0.27.1: column routing. See pglite-engine.ts searchVector for rationale.
-    const col = opts?.embeddingColumn === 'embedding_image' ? 'embedding_image' : 'embedding';
-    const modalityFilter = col === 'embedding_image' ? `AND cc.modality = 'image'` : `AND cc.modality = 'text'`;
+    // v0.36 (Phase 3): embedding_multimodal column added. Unified column has
+    // BOTH text and image content embedded in Voyage multimodal-3 space, so
+    // no modality filter applies — the column itself is the filter (rows
+    // without embedding_multimodal aren't searched).
+    let col: 'embedding' | 'embedding_image' | 'embedding_multimodal';
+    let modalityFilter: string;
+    if (opts?.embeddingColumn === 'embedding_image') {
+      col = 'embedding_image';
+      modalityFilter = `AND cc.modality = 'image'`;
+    } else if (opts?.embeddingColumn === 'embedding_multimodal') {
+      col = 'embedding_multimodal';
+      modalityFilter = ''; // unified column carries both modalities
+    } else {
+      col = 'embedding';
+      modalityFilter = `AND cc.modality = 'text'`;
+    }
 
     const rawQuery = `
       WITH hnsw_candidates AS (

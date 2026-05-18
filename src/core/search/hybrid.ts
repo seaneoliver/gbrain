@@ -412,9 +412,14 @@ export async function hybridSearch(
   // cross-modal path overrides bundle knobs (expansion=false, no keyword
   // search). Voyage handles synonyms in-space; zerank-2 can't rerank image
   // embeddings.
+  //
+  // Phase 3 (D8): when search.unified_multimodal is true, ALL queries
+  // route through the multimodal model + embedding_multimodal column,
+  // regardless of detected modality.
   const explicitModality =
     opts?.crossModal && opts.crossModal !== 'auto' ? opts.crossModal : undefined;
   const effectiveModality = explicitModality ?? suggestions.suggestedModality ?? 'text';
+  const unifiedRouting = resolvedMode.unified_multimodal === true;
 
   // Determine query variants (optionally with expansion)
   // expandQuery already includes the original query in its return value,
@@ -448,7 +453,47 @@ export async function hybridSearch(
   let imageVectorList: SearchResult[] | null = null;
   let crossModalFellOpen = false;
 
-  if (effectiveModality === 'image' || effectiveModality === 'both') {
+  // Phase 3 unified routing: when on, route ALL queries through Voyage
+  // multimodal-3 + embedding_multimodal column. Bypasses the dual-column
+  // branching below — but with D8 fail-open: if the unified path returns
+  // zero rows AND the operator hasn't opted into strict unified-only mode,
+  // fall through to the dual-column text path. unified_multimodal_only
+  // disables the fallback.
+  let unifiedDone = false;
+  if (unifiedRouting) {
+    try {
+      const { isAvailable: aiIsAvailable, embedQueryMultimodal } = await import('../ai/gateway.ts');
+      if (!aiIsAvailable('embedding')) {
+        throw new Error('gateway not configured for embedding — unified multimodal would also fail');
+      }
+      const unifiedEmbedding = await embedQueryMultimodal(query);
+      const unifiedSearchOpts: SearchOpts = {
+        ...searchOpts,
+        embeddingColumn: 'embedding_multimodal',
+      };
+      const unifiedList = await engine.searchVector(unifiedEmbedding, unifiedSearchOpts);
+      // D8 fail-open: zero rows + not strict-mode → fall through to dual-column.
+      if (unifiedList.length === 0 && !resolvedMode.unified_multimodal_only) {
+        console.error(
+          `[cross-modal] unified_multimodal returned zero rows for query="${query.slice(0, 60)}". ` +
+          `Falling back to dual-column text path (partial coverage during reindex). ` +
+          `Set search.unified_multimodal_only=true to bypass this fallback when reindex completes.`,
+        );
+      } else {
+        vectorLists = [unifiedList];
+        queryEmbedding = unifiedEmbedding;
+        unifiedDone = true;
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[cross-modal] unified_multimodal embed failed; falling back to dual-column path. reason=${reason}`,
+      );
+      crossModalFellOpen = true;
+    }
+  }
+
+  if (!unifiedDone && (effectiveModality === 'image' || effectiveModality === 'both')) {
     // Attempt image-side embedding. Fail-open: if multimodal is unconfigured
     // OR the embed throws, log a structured warning and fall through to text.
     try {
@@ -482,7 +527,11 @@ export async function hybridSearch(
     }
   }
 
-  if (effectiveModality === 'image' && imageVectorList !== null) {
+
+  if (unifiedDone) {
+    // Unified routing already populated vectorLists + queryEmbedding;
+    // skip the dual-column branching.
+  } else if (effectiveModality === 'image' && imageVectorList !== null) {
     // Image-only path: results come entirely from the image column.
     vectorLists = [imageVectorList];
     queryEmbedding = null; // no text embedding to cosine-re-score against
