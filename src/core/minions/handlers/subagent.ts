@@ -1161,4 +1161,9 @@ export const __testing = {
   persistToolExecFailed,
   asStringIfNotObject,
   DEFAULT_MODEL,
+  // v0.38 Slice 1 D5 — read-time shim for crash-replay across the v1→v2
+  // content_blocks shape boundary. Exposed for test/subagent-v1-v2-shim.test.ts
+  // which pins legacy-row adaptation correctness.
+  adaptContentBlocksToChatBlocks,
+  loadPriorToolsV2,
 };
