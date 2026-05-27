@@ -181,6 +181,48 @@ CREATE TRIGGER bump_page_generation_trg
 -- CREATE INDEX since the table is empty.
 CREATE INDEX IF NOT EXISTS pages_generation_idx ON pages (generation);
 
+-- v0.41.19.0 (D18/D19, codex outside-voice): global page-generation clock.
+-- The pre-v0.41.19.0 Layer 1 bookmark read `MAX(generation) FROM pages` to
+-- detect "writes happened since cache-store". Two bugs in that contract:
+--   1. The row-level trigger above sets `NEW.generation = OLD.generation + 1`
+--      on UPDATE. Updating a NON-MAX page didn't advance MAX(generation),
+--      silently serving stale cached results.
+--   2. The trigger is `BEFORE INSERT OR UPDATE` so DELETE doesn't fire it
+--      at all — and even if it did, DELETE doesn't touch surviving rows,
+--      so MAX(generation) wouldn't budge.
+--
+-- The fix: a single-row counter, bumped per-statement (FOR EACH STATEMENT
+-- — codex CDX-4: per-row would turn 73K-row batch DELETE into 73K UPDATEs
+-- on the same counter, recreating the bottleneck this PR is fixing). Layer
+-- 1 reads `page_generation_clock.value` directly. The per-row
+-- `pages.generation` column above stays as the Layer 2 (per-page snapshot)
+-- substrate.
+--
+-- Seeded with COALESCE(MAX(pages.generation), 0) so existing query_cache
+-- rows stored under the old MAX semantics aren't all instantly invalidated
+-- on upgrade (their max_generation_at_store stamp compares cleanly against
+-- the seeded clock; future writes bump the clock, bookmark fires correctly).
+CREATE TABLE IF NOT EXISTS page_generation_clock (
+  id    INTEGER PRIMARY KEY CHECK (id = 1),
+  value BIGINT  NOT NULL DEFAULT 0
+);
+INSERT INTO page_generation_clock (id, value)
+  VALUES (1, COALESCE((SELECT MAX(generation) FROM pages), 0))
+  ON CONFLICT (id) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION bump_page_generation_clock_fn() RETURNS trigger AS $func$
+BEGIN
+  UPDATE page_generation_clock SET value = value + 1 WHERE id = 1;
+  RETURN NULL;
+END;
+$func$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS bump_page_generation_clock_trg ON pages;
+CREATE TRIGGER bump_page_generation_clock_trg
+  AFTER INSERT OR UPDATE OR DELETE ON pages
+  FOR EACH STATEMENT
+  EXECUTE FUNCTION bump_page_generation_clock_fn();
+
 CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(type);
 CREATE INDEX IF NOT EXISTS idx_pages_frontmatter ON pages USING GIN(frontmatter);
 CREATE INDEX IF NOT EXISTS idx_pages_trgm ON pages USING GIN(title gin_trgm_ops);
