@@ -44,6 +44,8 @@ This skill guarantees:
 
 ## Phases
 
+0. **Always call `search` first** for any lookup or "who/what/tell me about" question, even if you expect no results. For "tell me about X" questions, ALSO call `get_page` on the most relevant slug. For relationship/connection questions, ALSO call `traverse_graph`.
+
 1. **Decompose the question** into search strategies:
    - Keyword search for specific names, dates, terms
    - Semantic query for conceptual questions
