@@ -93,10 +93,13 @@ timeout 120s bun run src/cli.ts init --pglite --yes --no-embedding >> "$LOG" 2>&
 # Register the brain dir as a source. Use raw SQL since `gbrain sources add`
 # might not exist in this version-window; the schema is what doctor reads.
 echo "[fm_wallclock] register source..." | tee -a "$LOG"
-bun run -e "
+bun -e "
 import { PGLiteEngine } from './src/core/pglite-engine.ts';
+import { loadConfigFileOnly } from './src/core/config.ts';
+const cfg = loadConfigFileOnly();
+if (!cfg?.database_path) throw new Error('expected PGLite database_path after init');
 const e = new PGLiteEngine();
-await e.connect({});
+await e.connect({ engine: 'pglite', database_path: cfg.database_path });
 await e.initSchema();
 await e.executeRaw(
   \"INSERT INTO sources (id, name, local_path) VALUES ('fm-wallclock', 'Frontmatter wallclock test', \\\$1)\",
