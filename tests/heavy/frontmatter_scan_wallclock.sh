@@ -25,8 +25,9 @@
 # at that scale the test passes BEFORE AND AFTER the fix, proving nothing.
 # This script's 60K-file budget is the minimum that catches the regression.
 #
-# Works on either PGLite (default, no DATABASE_URL required) or Postgres
-# (set DATABASE_URL to test the Postgres SQL paths).
+# This harness is intentionally PGLite-only. The shared heavy-test workflow
+# exports DATABASE_URL for Postgres-specific siblings, so clear both URL
+# overrides below to keep init, registration, and doctor on the same brain.
 
 set -euo pipefail
 
@@ -40,6 +41,7 @@ TS=$(date -u +%Y%m%d-%H%M%SZ)
 # Isolate from the developer's real ~/.gbrain. Each run uses a fresh tmpdir.
 TMP_GBRAIN_HOME=$(mktemp -d -t gbrain-fm-wallclock-home-XXXXXX)
 export GBRAIN_HOME="$TMP_GBRAIN_HOME"
+unset DATABASE_URL GBRAIN_DATABASE_URL
 BRAIN_DIR=$(mktemp -d -t gbrain-fm-wallclock-brain-XXXXXX)
 LOG_DIR="$GBRAIN_HOME/audit"
 mkdir -p "$LOG_DIR"
@@ -121,20 +123,27 @@ DOCTOR_MS=$(( (DOCTOR_END_NS - DOCTOR_START_NS) / 1000000 ))
 echo "[fm_wallclock] doctor exit=$DOCTOR_RC wallclock=${DOCTOR_MS}ms" | tee -a "$LOG"
 
 # Step 4: assert.
-# RC 124 = `timeout` killed it. Other non-zero = doctor warns/fails, also FYI
-# but allowed for unrelated reasons. The load-bearing assertion is the
-# frontmatter_integrity status from the JSON.
-if [ "$DOCTOR_RC" = "124" ]; then
-  echo "[fm_wallclock] FAIL: doctor exceeded ${WALLCLOCK_BUDGET_S}s budget — the v0.38.2.0 pruneDir wiring is broken" >&2
-  echo "  Log tail:" >&2
-  tail -30 "$LOG" >&2
-  exit 1
-fi
+# Doctor's public exit contract is 0 for healthy and 1 when any check fails.
+# Timeout (124) and every other code are harness failures, not valid warnings.
+case "$DOCTOR_RC" in
+  0|1) ;;
+  124)
+    echo "[fm_wallclock] FAIL: doctor exceeded ${WALLCLOCK_BUDGET_S}s budget — the v0.38.2.0 pruneDir wiring is broken" >&2
+    echo "  Log tail:" >&2
+    tail -30 "$LOG" >&2
+    exit 1
+    ;;
+  *)
+    echo "[fm_wallclock] FAIL: doctor exited with unexpected status $DOCTOR_RC (expected 0 or 1)" >&2
+    echo "  Log tail:" >&2
+    tail -30 "$LOG" >&2
+    exit 1
+    ;;
+esac
 
 if ! command -v jq >/dev/null 2>&1; then
-  echo "[fm_wallclock] WARN: jq not installed; skipping JSON-shape assertion" >&2
-  echo "[fm_wallclock] PASS (wall-clock check passed; JSON assertion skipped)" | tee -a "$LOG"
-  exit 0
+  echo "[fm_wallclock] FAIL: jq is required to validate doctor JSON output" >&2
+  exit 1
 fi
 
 FM_STATUS=$(jq -r '.checks[] | select(.name=="frontmatter_integrity") | .status' "$LOG.doctor")

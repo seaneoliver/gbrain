@@ -92,6 +92,11 @@ describe('doctor frontmatter_integrity heavy regression harness', () => {
     expect(FRONTMATTER_HEAVY_SCRIPT).toContain('bun -e "');
     expect(FRONTMATTER_HEAVY_SCRIPT).not.toContain('bun run -e "');
     expect(FRONTMATTER_HEAVY_SCRIPT).toContain("loadConfigFileOnly()");
-    expect(FRONTMATTER_HEAVY_SCRIPT).toContain("await e.connect({ engine: 'pglite', database_path: cfg.database_path });");
+    expect(FRONTMATTER_HEAVY_SCRIPT).toContain(
+      "await e.connect({ engine: 'pglite', database_path: cfg.database_path });",
+    );
+    expect(FRONTMATTER_HEAVY_SCRIPT).toContain('unset DATABASE_URL GBRAIN_DATABASE_URL');
+    expect(FRONTMATTER_HEAVY_SCRIPT).toContain('0|1) ;;');
+    expect(FRONTMATTER_HEAVY_SCRIPT).toContain('jq is required to validate doctor JSON output');
   });
 });
