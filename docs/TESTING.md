@@ -3,6 +3,8 @@
 On-demand reference (see CLAUDE.md Reference map). Current behavior + invariants
 only.
 
+`test/e2e/serve-http-oauth.test.ts` additionally pins confidential POST/Basic revocation, public-client SDK fallthrough, malformed/mixed authentication rejection, cross-client isolation, unknown-token opacity, metadata auth methods, no-store responses, strict post-revoke `401`, and retryable backend `503` semantics.
+
 ### Test command tiers
 
 Seven test command tiers, each with a clear scope:
@@ -16,6 +18,29 @@ Seven test command tiers, each with a clear scope:
 | `bun run test:serial` | Just the `*.serial.test.ts` set (cross-file-contention quarantine; one bun process per file for true module-registry isolation). | ~1s per quarantined file | Debugging a specific quarantined file. |
 | `bun run test:e2e` | Real Postgres E2E. Requires Docker + `DATABASE_URL`. Sequential. | ~5-10min | Pre-ship; nightly. |
 | `bun run check:all` | The historical pre-check scripts (22, chained sequentially in package.json). Overlaps `verify` heavily but is NOT a superset — `verify`'s `CHECKS` array in `scripts/run-verify-parallel.sh` (~30 entries incl. typecheck) is the authoritative gate; `check:all` keeps a few local-only extras (trailing-newline, exports-count, no-legacy-getconnection). | ~10s | Local-only sweep for the extras. |
+
+### Shell dispatch and Windows
+
+All four of `test`, `verify`, `ci:local` and `test:e2e` hand off to shell scripts
+under `scripts/`, so every `check:*` entry in `package.json` invokes its script as
+`bash scripts/<name>.sh` instead of relying on the shebang — bun on Windows cannot
+exec a `.sh` directly. Add a new shell-script check with that same prefix. The
+`scripts/*.ts` entries run under bun and take no prefix.
+
+The scripts must also be on disk with Unix line endings. A strict bash (WSL, Linux
+CI, macOS) rejects CRLF and dies on the script's first meaningful line; the Cygwin
+bash that ships with Git for Windows tolerates it, so a green local run is not by
+itself evidence that a script is CRLF-clean.
+The root `.gitattributes` pins `*.sh text eol=lf`, which overrides the
+`core.autocrlf=true` default that Git for Windows installs. Working copies cloned
+before that pin need a one-time `git rm --cached -r . -q && git reset --hard` to
+pick it up; see the Windows section of `CONTRIBUTING.md`.
+
+Wallclock figures in the table above are from a Mac dev box. Windows is
+substantially slower because each check pays full process-creation cost, and three
+tree-walking checks (`check:privacy`, `check:test-names`, `check:test-isolation`)
+plus `typecheck` can exceed the 120s per-check cap in `run-verify-parallel.sh`
+there even though they pass on Linux and macOS.
 
 ### CI vs local: intentionally divergent file sets
 
@@ -187,8 +212,10 @@ Unit tests and what they cover:
 - `test/orphans.test.ts` — orphans command: detection, pseudo filtering, text/json/count outputs, MCP op.
 - `test/postgres-engine.test.ts` — `statement_timeout` scoping: `sql.begin` + `SET LOCAL` shape, source-level grep guardrail against a reintroduced bare `SET statement_timeout`.
 - `test/sync.test.ts` — sync logic + regression guard asserting top-level `engine.transaction` is not called.
+- `test/sync-pull-failed-anchor.serial.test.ts` — #3068 regression: a failed internal `git pull` (local-path origin vs `protocol.file.allow=never`) with zero imports returns `partial`/`pull_failed` (not `up_to_date`), freezes `last_commit` + `last_sync_at`, recovers after a manual pull; fall-through import of local commits preserved. Serial: pins `GBRAIN_HOME` to a temp dir for the whole file.
 - `test/sync-concurrency.test.ts` — `autoConcurrency()` thresholds + PGLite-forces-serial + explicit-override clamping; `shouldRunParallel()` explicit-bypasses-floor contract; `parseWorkers()` validation rejecting `'0'`/`'-3'`/`'foo'`/`'1.5'`/trailing chars.
 - `test/sync-parallel.test.ts` — PGLite-routed coverage of the bookmark gate under concurrency, head-drift gate, vanished-file failure capture, PGLite-stays-serial, and the `gbrain-sync` writer-lock contract.
+- `test/sync-all-missing-path.test.ts` — `sync --all --missing-path <fail|skip>` pure helpers: `parseMissingPathMode` (default fail, explicit values, loud rejection of bad/dangling values, never swallows a following flag) and `partitionMissingPathSources` (classification driven only by the injected pathExists predicate — no fs; null `local_path` passes through runnable; order preserved).
 - `test/sync-failures.test.ts` — `classifyErrorCode` regex coverage for all 12 codes against literal production message strings from `markdown.ts` and `import-file.ts`; `summarizeFailuresByCode` sort + pre-classified-honor; `recordSyncFailures` code-field persistence; `acknowledgeSyncFailures` `AcknowledgeResult` shape + backfill on legacy entries.
 - `test/doctor.test.ts` — doctor command; assertions that `jsonb_integrity` scans the four JSONB write sites and `markdown_body_completeness` is present.
 - `test/utils.test.ts` — shared SQL utilities + `tryParseEmbedding` null-return and single-warn semantics.
