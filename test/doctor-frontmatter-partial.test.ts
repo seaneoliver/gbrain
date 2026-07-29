@@ -91,10 +91,13 @@ describe('doctor frontmatter_integrity heavy regression harness', () => {
   test('heavy wallclock harness registers its source with bun eval against the configured PGLite db', () => {
     expect(FRONTMATTER_HEAVY_SCRIPT).toContain('bun -e "');
     expect(FRONTMATTER_HEAVY_SCRIPT).not.toContain('bun run -e "');
-    expect(FRONTMATTER_HEAVY_SCRIPT).toContain("loadConfigFileOnly()");
-    expect(FRONTMATTER_HEAVY_SCRIPT).toContain(
-      "await e.connect({ engine: 'pglite', database_path: cfg.database_path });",
-    );
+    // The harness must resolve the engine from the config `init` just wrote.
+    // Upstream moved this off a hand-built PGLiteEngine onto the generic
+    // loadConfig/toEngineConfig/createEngine path; the guard below is the part
+    // that matters, since connecting blind is the original split-brain bug.
+    expect(FRONTMATTER_HEAVY_SCRIPT).toContain("loadConfig()");
+    expect(FRONTMATTER_HEAVY_SCRIPT).toContain("await e.connect(engineConfig);");
+    expect(FRONTMATTER_HEAVY_SCRIPT).not.toContain("await e.connect({})");
     expect(FRONTMATTER_HEAVY_SCRIPT).toContain('unset DATABASE_URL GBRAIN_DATABASE_URL');
     expect(FRONTMATTER_HEAVY_SCRIPT).toContain('0|1) ;;');
     expect(FRONTMATTER_HEAVY_SCRIPT).toContain('jq is required to validate doctor JSON output');
