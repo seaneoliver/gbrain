@@ -13,7 +13,29 @@ import type {
   NewFact, FactListOpts, FactsHealth,
   SourceRow,
 } from './engine.ts';
-import { withRetry, BULK_RETRY_OPTS, resolveBulkRetryOpts, computeNextDelay, type BatchAuditSite } from './retry.ts';
+// Engine-path imports stay static unless a call site carries an explicit
+// engine-dynamic-import-ok justification. The gateway is the only current
+// exception because its local try/catch preserves a soft fallback.
+import {
+  withRetry,
+  BULK_RETRY_OPTS,
+  resolveBulkRetryOpts,
+  computeNextDelay,
+  isRetryableConnError,
+  type BatchAuditSite,
+} from './retry.ts';
+import { isConnectionEndedError } from './retry-matcher.ts';
+import {
+  valueHash,
+  normalizeDimension,
+  isNovelDimension,
+} from './chronicle/ontology.ts';
+import {
+  resolveRecencyDecayMap,
+  DEFAULT_FALLBACK,
+} from './search/recency-decay.ts';
+import { logDbDisconnect } from './audit/db-disconnect-audit.ts';
+import { logPoolRecovery } from './audit/pool-recovery-audit.ts';
 import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatchExhausted } from './audit/batch-retry-audit.ts';
 import type {
   DomainBankSampleOpts, CorpusSampleOpts, DomainBankRow,
@@ -331,7 +353,6 @@ export class PostgresEngine implements BrainEngine {
     // even a no-op disconnect (engine that was never connected) is
     // recorded — that case may itself be a caller-side bug worth seeing.
     try {
-      const { logDbDisconnect } = await import('./audit/db-disconnect-audit.ts');
       logDbDisconnect('postgres', this._connectionStyle ?? 'unknown');
     } catch { /* best-effort; never block disconnect on audit failure */ }
     // v0.30.1: tear down the direct pool first if the manager owns one.
@@ -381,7 +402,9 @@ export class PostgresEngine implements BrainEngine {
     let dims: number = DEFAULT_EMBEDDING_DIMENSIONS;
     let model: string = DEFAULT_EMBEDDING_MODEL;
     try {
-      const gw = await import('./ai/gateway.ts');
+      // Keep the gateway lazy: its static closure is large, and evaluation inside
+      // this try/catch preserves the unconfigured-gateway default fallback.
+      const gw = await import('./ai/gateway.ts'); // engine-dynamic-import-ok
       // Both accessors THROW when the gateway is unconfigured (they never
       // return falsy), so the catch below is the only fallback path (#3461).
       dims = gw.getEmbeddingDimensions();
@@ -2381,8 +2404,8 @@ export class PostgresEngine implements BrainEngine {
       if (err instanceof Error && err.name === 'RetryAbortError') throw err;
       // Best-effort exhausted-retry log. If the error wasn't retryable in
       // the first place, isRetryableConnError(err) is false and we skip.
-      // Lazy-import to avoid a circular dep concern.
-      const { isRetryableConnError } = await import('./retry.ts');
+      // retry.ts is already in this module's static graph through withRetry, so
+      // classifying the exhausted error does not need a second runtime import.
       if (isRetryableConnError(err)) {
         auditLogBatchExhausted(auditSite, batchSize, opts.maxRetries + 1, err);
       }
@@ -2451,7 +2474,9 @@ export class PostgresEngine implements BrainEngine {
     // is the LAST resort (fresh brain whose config row doesn't exist yet).
     let resolvedModel: string | null = null;
     try {
-      const gw = await import('./ai/gateway.ts');
+      // Keep the gateway lazy so module-load failure remains inside this soft
+      // fallback boundary; eager evaluation would bypass the config-row fallback.
+      const gw = await import('./ai/gateway.ts'); // engine-dynamic-import-ok
       resolvedModel = gw.getEmbeddingModel();
     } catch {
       try {
@@ -2502,15 +2527,15 @@ export class PostgresEngine implements BrainEngine {
 
     // Single statement upsert: preserves existing embeddings via COALESCE when new value is NULL.
     // CONSISTENCY: when chunk_text changes and no new embedding is supplied, BOTH embedding AND
-    // embedded_at must reset to NULL so `embed --stale` correctly picks up the row for re-embedding.
+    // embedded_at must reset to NULL so 'embed --stale' correctly picks up the row for re-embedding.
     // Without this, embedded_at lies (says "embedded" while embedding=NULL), and any staleness
     // predicate on embedded_at would silently skip the row. This is why the egress fix predicates
-    // on `embedding IS NULL` rather than `embedded_at IS NULL` — and it's why we now keep both
+    // on 'embedding IS NULL' rather than `embedded_at IS NULL` — and it's why we now keep both
     // columns honest at write time.
     //
     // v0.40.3.0 D24 NULL→non-NULL race fix (TODOS.md v0.35.x item).
     // Two writers racing on the same chunk (e.g., autopilot sync + manual
-    // `embed --stale` + contextual reindex) previously raced last-write-wins
+    // 'embed --stale' + contextual reindex) previously raced last-write-wins
     // via `COALESCE(EXCLUDED.embedding, content_chunks.embedding)`. With
     // per-chunk Haiku synopsis the cost of an overwrite jumped from
     // ~$0.000001 to ~$0.0003. New rule for the text-unchanged branch:
@@ -3027,9 +3052,11 @@ export class PostgresEngine implements BrainEngine {
       if (opts?.sourceIds && opts.sourceIds.length > 0) {
         const ids = opts.sourceIds;
         const rows = await tx`
-          SELECT f.slug as from_slug, t.slug as to_slug,
+          SELECT f.slug as from_slug, f.source_id as from_source_id,
+                 t.slug as to_slug, t.source_id as to_source_id,
                  l.link_type, l.context, l.link_source,
-                 o.slug as origin_slug, l.origin_field
+                 o.slug as origin_slug, o.source_id as origin_source_id,
+                 l.origin_field
           FROM links l
           JOIN pages f ON f.id = l.from_page_id
           JOIN pages t ON t.id = l.to_page_id
@@ -3044,9 +3071,11 @@ export class PostgresEngine implements BrainEngine {
       // opts.sourceId, scope the from-page lookup.
       if (opts?.sourceId) {
         const rows = await tx`
-          SELECT f.slug as from_slug, t.slug as to_slug,
+          SELECT f.slug as from_slug, f.source_id as from_source_id,
+                 t.slug as to_slug, t.source_id as to_source_id,
                  l.link_type, l.context, l.link_source,
-                 o.slug as origin_slug, l.origin_field
+                 o.slug as origin_slug, o.source_id as origin_source_id,
+                 l.origin_field
           FROM links l
           JOIN pages f ON f.id = l.from_page_id
           JOIN pages t ON t.id = l.to_page_id
@@ -3056,9 +3085,11 @@ export class PostgresEngine implements BrainEngine {
         return rows as unknown as Link[];
       }
       const rows = await tx`
-        SELECT f.slug as from_slug, t.slug as to_slug,
+        SELECT f.slug as from_slug, f.source_id as from_source_id,
+               t.slug as to_slug, t.source_id as to_source_id,
                l.link_type, l.context, l.link_source,
-               o.slug as origin_slug, l.origin_field
+               o.slug as origin_slug, o.source_id as origin_source_id,
+               l.origin_field
         FROM links l
         JOIN pages f ON f.id = l.from_page_id
         JOIN pages t ON t.id = l.to_page_id
@@ -3080,9 +3111,11 @@ export class PostgresEngine implements BrainEngine {
       if (opts?.sourceIds && opts.sourceIds.length > 0) {
         const ids = opts.sourceIds;
         const rows = await tx`
-          SELECT f.slug as from_slug, t.slug as to_slug,
+          SELECT f.slug as from_slug, f.source_id as from_source_id,
+                 t.slug as to_slug, t.source_id as to_source_id,
                  l.link_type, l.context, l.link_source,
-                 o.slug as origin_slug, l.origin_field
+                 o.slug as origin_slug, o.source_id as origin_source_id,
+                 l.origin_field
           FROM links l
           JOIN pages f ON f.id = l.from_page_id
           JOIN pages t ON t.id = l.to_page_id
@@ -3094,9 +3127,11 @@ export class PostgresEngine implements BrainEngine {
       // v0.31.8 (D16) + #2200: federated arm above is first; two below mirror getLinks.
       if (opts?.sourceId) {
         const rows = await tx`
-          SELECT f.slug as from_slug, t.slug as to_slug,
+          SELECT f.slug as from_slug, f.source_id as from_source_id,
+                 t.slug as to_slug, t.source_id as to_source_id,
                  l.link_type, l.context, l.link_source,
-                 o.slug as origin_slug, l.origin_field
+                 o.slug as origin_slug, o.source_id as origin_source_id,
+                 l.origin_field
           FROM links l
           JOIN pages f ON f.id = l.from_page_id
           JOIN pages t ON t.id = l.to_page_id
@@ -3106,9 +3141,11 @@ export class PostgresEngine implements BrainEngine {
         return rows as unknown as Link[];
       }
       const rows = await tx`
-        SELECT f.slug as from_slug, t.slug as to_slug,
+        SELECT f.slug as from_slug, f.source_id as from_source_id,
+               t.slug as to_slug, t.source_id as to_source_id,
                l.link_type, l.context, l.link_source,
-               o.slug as origin_slug, l.origin_field
+               o.slug as origin_slug, o.source_id as origin_source_id,
+               l.origin_field
         FROM links l
         JOIN pages f ON f.id = l.from_page_id
         JOIN pages t ON t.id = l.to_page_id
@@ -3983,7 +4020,6 @@ export class PostgresEngine implements BrainEngine {
   async mergeOntologyFact(obs: OntologyObservationInput): Promise<OntologyMergeResult> {
     const sql = this.sql;
     const sourceId = obs.sourceId ?? 'default';
-    const { valueHash, normalizeDimension, isNovelDimension } = await import('./chronicle/ontology.ts');
     const dimension = normalizeDimension(obs.dimension);
     const vh = valueHash(obs.value);
     const conf = obs.confidence ?? 0.7;
@@ -4455,9 +4491,13 @@ export class PostgresEngine implements BrainEngine {
             ${input.row_num}, ${input.source_markdown_slug},
             ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod},
             ${eventType}
-          ) RETURNING id
+          )
+          ON CONFLICT (source_id, source_markdown_slug, row_num)
+          WHERE row_num IS NOT NULL
+          DO NOTHING
+          RETURNING id
         `;
-        out.push(Number(ins[0].id));
+        if (ins[0]) out.push(Number(ins[0].id));
       }
       return out;
     });
@@ -5449,7 +5489,25 @@ export class PostgresEngine implements BrainEngine {
         (SELECT count(*) FROM links l
          WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = l.to_page_id)
         ) as dead_links,
-        (SELECT count(*) FROM content_chunks WHERE embedded_at IS NULL) as missing_embeddings,
+        -- missing_embeddings uses the same predicate as the thing that
+        -- resolves it: buildStaleChunkWhere / countStaleChunks, i.e. what
+        -- 'embed --stale' actually processes. Two divergences existed:
+        --   1. embedded_at vs embedding. upsertChunks resets BOTH to NULL
+        --      when chunk_text changes, but the stale-chunk predicate keys
+        --      on 'embedding IS NULL' deliberately (see the CONSISTENCY note
+        --      on that upsert) because embedded_at can be non-NULL while
+        --      embedding is NULL. Health should agree with the embedder.
+        --   2. embed_skip pages were counted here but excluded there, so
+        --      chunks the author opted out of read as permanently "missing"
+        --      and the count could never reach zero.
+        -- Effect of the mismatch: computeRecommendations emits an embed.stale
+        -- step from a number that 'embed --stale' reports as 0, so the step
+        -- cannot move it and 'doctor --remediate' re-plans it every pass.
+        (SELECT count(*) FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+          WHERE cc.embedding IS NULL
+            AND NOT jsonb_exists(COALESCE(p.frontmatter, '{}'::jsonb), 'embed_skip')
+        ) as missing_embeddings,
         (SELECT count(*) FROM links) as link_count,
         (SELECT count(*) FROM entity_pages e
          WHERE EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = e.id))::float /
@@ -5823,12 +5881,10 @@ export class PostgresEngine implements BrainEngine {
     let isReap = false;
     if (ctx?.error !== undefined) {
       try {
-        const { isConnectionEndedError } = await import('./retry-matcher.ts');
         isReap = isConnectionEndedError(ctx.error);
       } catch { /* classification is best-effort */ }
     }
     try {
-      const { logPoolRecovery } = await import('./audit/pool-recovery-audit.ts');
       logPoolRecovery(isReap ? 'reap_detected' : 'reconnect_other', ctx?.error);
     } catch { /* audit is best-effort */ }
 
@@ -5852,7 +5908,6 @@ export class PostgresEngine implements BrainEngine {
       // New pool is live — discard the old one best-effort.
       if (oldSql) { try { await oldSql.end({ timeout: 5 }); } catch { /* swallow */ } }
       try {
-        const { logPoolRecovery } = await import('./audit/pool-recovery-audit.ts');
         logPoolRecovery('reconnect_succeeded');
       } catch { /* best-effort */ }
     } catch (err) {
@@ -5864,7 +5919,6 @@ export class PostgresEngine implements BrainEngine {
       this._sql = oldSql;
       this.connectionManager = oldManager;
       try {
-        const { logPoolRecovery } = await import('./audit/pool-recovery-audit.ts');
         logPoolRecovery('reconnect_failed', err);
       } catch { /* best-effort */ }
       throw err; // let batchRetry's backoff handle the retry
@@ -6301,7 +6355,6 @@ export class PostgresEngine implements BrainEngine {
     const recencyBias = opts.recency_bias ?? 'flat';
     let recencySql: string;
     if (recencyBias === 'on') {
-      const { resolveRecencyDecayMap, DEFAULT_FALLBACK } = await import('./search/recency-decay.ts');
       recencySql = buildRecencyComponentSql({
         slugColumn: 'p.slug',
         dateExpr: 'COALESCE(p.effective_date, p.updated_at)',
