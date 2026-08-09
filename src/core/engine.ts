@@ -990,12 +990,15 @@ export interface BrainEngine {
    */
   upsertChunks(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string } & BatchOpts): Promise<void>;
   /**
-   * Read every chunk for a page. `opts.sourceId` source-scopes the page
-   * lookup; without it, multi-source brains return chunks from every
-   * same-slug source (importCodeFile uses this for incremental embedding
-   * reuse, which would then attach the wrong source's embeddings).
+   * Read every chunk for a page. Scope precedence mirrors getPage (#2555):
+   * a federated grant (`sourceIds[]`) wins over scalar `sourceId`; with
+   * neither set, the lookup falls back to the `'default'` source (the
+   * local-untyped-call default that importCodeFile's incremental embedding
+   * reuse relies on). Embedding vectors are never selected — rowToChunk
+   * discards them at these call sites, so pulling them was pure egress
+   * (#2544).
    */
-  getChunks(slug: string, opts?: { sourceId?: string }): Promise<Chunk[]>;
+  getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Chunk[]>;
   /**
    * Count chunks across the brain where embedding IS NULL.
    * Pre-flight short-circuit for `embed --stale` so a 100%-embedded brain
@@ -1499,7 +1502,7 @@ export interface BrainEngine {
    * it, multi-source brains return raw_data rows from every same-slug page
    * (preserved via two-branch query for back-compat).
    */
-  getRawData(slug: string, source?: string, opts?: { sourceId?: string }): Promise<RawData[]>;
+  getRawData(slug: string, source?: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<RawData[]>;
 
   // Files (v0.27.1: binary asset metadata + storage_path. Image bytes never
   // enter the DB; storage_path references a path inside the brain repo or an
@@ -1925,7 +1928,7 @@ export interface BrainEngine {
    * When omitted, returns versions for every same-slug page across sources
    * (pre-v0.31.8 behavior; preserved via two-branch query).
    */
-  getVersions(slug: string, opts?: { sourceId?: string }): Promise<PageVersion[]>;
+  getVersions(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<PageVersion[]>;
   /**
    * v0.31.8 (D12): `opts.sourceId` source-scopes both the version lookup
    * and the page revert. Without it, multi-source brains can revert the
@@ -2104,6 +2107,9 @@ export interface BrainEngine {
 
   // Migration support
   runMigration(version: number, sql: string): Promise<void>;
+  // Deliberately scalar-only (no sourceIds[] widening): engine-internal with
+  // zero remote-reachable callers (verified #2555 review), so the federated
+  // read-scope contract doesn't apply. Widen only if an op ever exposes it.
   getChunksWithEmbeddings(slug: string, opts?: { sourceId?: string }): Promise<Chunk[]>;
 
   // Raw SQL (for Minions job queue and other internal modules)

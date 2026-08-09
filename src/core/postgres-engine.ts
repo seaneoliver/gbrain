@@ -48,7 +48,7 @@ import { sanitizeForJsonb, buildLinkRows, buildTimelineRows, buildTakeRows } fro
 import { runMigrations } from './migrate.ts';
 import { SCHEMA_SQL } from './schema-embedded.ts';
 import { verifySchema } from './schema-verify.ts';
-import { applyChunkEmbeddingIndexPolicy, dropZombieIndexes } from './vector-index.ts';
+import { applyChunkEmbeddingIndexPolicy, dropZombieIndexes, hnswEfSearchFor } from './vector-index.ts';
 import {
   normalizeEngineColumn,
   buildVectorCastFragment,
@@ -624,7 +624,13 @@ export class PostgresEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.tables
                 WHERE table_schema = current_schema() AND table_name = 'timeline_entries') AS timeline_entries_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema = current_schema() AND table_name = 'timeline_entries' AND column_name = 'event_page_id') AS timeline_event_page_id_exists
+                WHERE table_schema = current_schema() AND table_name = 'timeline_entries' AND column_name = 'event_page_id') AS timeline_event_page_id_exists,
+        EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema = current_schema() AND table_name = 'minion_jobs') AS minion_jobs_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'minion_jobs' AND column_name = 'timeout_at') AS minion_jobs_timeout_at_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'minion_jobs' AND column_name = 'idempotency_key') AS minion_jobs_idempotency_key_exists
     `;
     const probe = probeRows[0]!;
 
@@ -703,6 +709,9 @@ export class PostgresEngine implements BrainEngine {
       pages_links_extracted_at_exists?: boolean;
       timeline_entries_exists?: boolean;
       timeline_event_page_id_exists?: boolean;
+      minion_jobs_exists?: boolean;
+      minion_jobs_timeout_at_exists?: boolean;
+      minion_jobs_idempotency_key_exists?: boolean;
     };
     const needsContextualRetrievalColumns = (probe.pages_exists
         && (!probeCr.pages_cr_mode_exists || !probeCr.pages_corpus_generation_exists))
@@ -725,6 +734,14 @@ export class PostgresEngine implements BrainEngine {
     // v121: schema-blob indexes reference event_page_id before migrations run.
     const needsTimelineEventPageId = probeCr.timeline_entries_exists === true
       && !probeCr.timeline_event_page_id_exists;
+    // v7-era (#2626 class sweep): minion_jobs.timeout_at + idempotency_key are
+    // migration-added AND referenced by blob indexes (idx_minion_jobs_timeout,
+    // uniq_minion_jobs_idempotency) — a pre-v7 minion_jobs wedges blob replay
+    // exactly like the v121 incident.
+    const needsMinionJobsTimeoutAt = probeCr.minion_jobs_exists === true
+      && !probeCr.minion_jobs_timeout_at_exists;
+    const needsMinionJobsIdempotencyKey = probeCr.minion_jobs_exists === true
+      && !probeCr.minion_jobs_idempotency_key_exists;
 
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
         && !needsPagesDeletedAt && !needsMcpLogBootstrap && !needsSubagentProviderId
@@ -736,7 +753,8 @@ export class PostgresEngine implements BrainEngine {
         && !needsContextualRetrievalColumns && !needsPagesGeneration
         && !needsPagesEmbeddingSignature
         && !needsPagesLinksExtractedAt
-        && !needsTimelineEventPageId) return;
+        && !needsTimelineEventPageId
+        && !needsMinionJobsTimeoutAt && !needsMinionJobsIdempotencyKey) return;
 
     process.stderr.write('  Pre-v0.21 brain detected, applying forward-reference bootstrap\n');
 
@@ -989,6 +1007,20 @@ export class PostgresEngine implements BrainEngine {
       // source of truth for the FK and indexes and runs idempotently afterward.
       await conn.unsafe(`
         ALTER TABLE timeline_entries ADD COLUMN IF NOT EXISTS event_page_id INTEGER;
+      `);
+    }
+
+    if (needsMinionJobsTimeoutAt) {
+      // v7: blob index idx_minion_jobs_timeout references timeout_at; a
+      // pre-v7 minion_jobs wedges blob replay without it (same class as v121).
+      await conn.unsafe(`
+        ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS timeout_at TIMESTAMPTZ;
+      `);
+    }
+    if (needsMinionJobsIdempotencyKey) {
+      // v7: blob index uniq_minion_jobs_idempotency references idempotency_key.
+      await conn.unsafe(`
+        ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
       `);
     }
   }
@@ -2299,8 +2331,14 @@ export class PostgresEngine implements BrainEngine {
     // RLS scope binding + search-only timeout. alwaysTransaction: master
     // already wrapped this in sql.begin() for the SET LOCAL; flag off is
     // identical to that wrap, flag on adds set_config in the same tx.
+    //
+    // hnsw.ef_search: an HNSW scan returns at most ef_search rows (default
+    // 40), so the inner CTE's LIMIT past 40 was silently unreachable — see
+    // hnswEfSearchFor. Transaction-local (is_local=true); non-HNSW plans
+    // (seq scan, or corpora without the index) ignore the GUC.
     const rows = await this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, async (tx) => {
       await tx`SET LOCAL statement_timeout = '8s'`;
+      await tx`SELECT set_config('hnsw.ef_search', ${String(hnswEfSearchFor(innerLimit))}, true)`;
       return await tx.unsafe(rawQuery, params as Parameters<typeof tx.unsafe>[1]);
     }, { alwaysTransaction: true });
     return rows.map(rowToSearchResult);
@@ -2599,14 +2637,25 @@ export class PostgresEngine implements BrainEngine {
     );
   }
 
-  async getChunks(slug: string, opts?: { sourceId?: string }): Promise<Chunk[]> {
-    const sourceId = opts?.sourceId ?? 'default';
+  async getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Chunk[]> {
+    const sourceIds = opts?.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;
+    const scalarSourceId = opts?.sourceId ?? 'default';
     // RLS scope binding (opt-in via GBRAIN_RLS_SCOPE_BINDING).
-    return await this.withScopedReadTransaction(undefined, sourceId, async (tx) => {
+    return await this.withScopedReadTransaction(sourceIds, sourceIds ? undefined : scalarSourceId, async (tx) => {
+      const scope = sourceIds
+        ? tx`p.source_id = ANY(${sourceIds}::text[])`
+        : tx`p.source_id = ${scalarSourceId}`;
+      // #2544: explicit non-vector column list — rowToChunk discards
+      // embeddings at this call site (includeEmbedding defaults false), so
+      // `cc.*` shipped every vector over the wire only to be thrown away.
       const rows = await tx`
-        SELECT cc.* FROM content_chunks cc
+        SELECT cc.id, cc.page_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+               cc.model, cc.token_count, cc.embedded_at, cc.language,
+               cc.symbol_name, cc.symbol_type, cc.start_line, cc.end_line,
+               cc.parent_symbol_path, cc.doc_comment, cc.symbol_name_qualified, cc.modality
+        FROM content_chunks cc
         JOIN pages p ON p.id = cc.page_id
-        WHERE p.slug = ${slug} AND p.source_id = ${sourceId}
+        WHERE p.slug = ${slug} AND ${scope}
         ORDER BY cc.chunk_index
       `;
       return rows.map((r: Record<string, unknown>) => rowToChunk(r));
@@ -4182,15 +4231,21 @@ export class PostgresEngine implements BrainEngine {
   async getRawData(
     slug: string,
     source?: string,
-    opts?: { sourceId?: string },
+    opts?: { sourceId?: string; sourceIds?: string[] },
   ): Promise<RawData[]> {
     const sql = this.sql;
-    // v0.31.8 (D21): four-branch shape on (source provided, sourceId provided).
-    // Postgres.js template-literal style doesn't compose fragments cleanly so
-    // we enumerate.
-    const sourceId = opts?.sourceId;
+    const sourceIds = opts?.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;
+    const sourceId = sourceIds ? undefined : opts?.sourceId;
     let rows;
-    if (source && sourceId) {
+    if (source && sourceIds) {
+      rows = await sql`SELECT rd.source, rd.data, rd.fetched_at FROM raw_data rd
+        JOIN pages p ON p.id = rd.page_id
+        WHERE p.slug = ${slug} AND rd.source = ${source} AND p.source_id = ANY(${sourceIds}::text[])`;
+    } else if (sourceIds) {
+      rows = await sql`SELECT rd.source, rd.data, rd.fetched_at FROM raw_data rd
+        JOIN pages p ON p.id = rd.page_id
+        WHERE p.slug = ${slug} AND p.source_id = ANY(${sourceIds}::text[])`;
+    } else if (source && sourceId) {
       rows = await sql`SELECT rd.source, rd.data, rd.fetched_at FROM raw_data rd
         JOIN pages p ON p.id = rd.page_id
         WHERE p.slug = ${slug} AND rd.source = ${source} AND p.source_id = ${sourceId}`;
@@ -5378,9 +5433,17 @@ export class PostgresEngine implements BrainEngine {
     return rows[0] as unknown as PageVersion;
   }
 
-  async getVersions(slug: string, opts?: { sourceId?: string }): Promise<PageVersion[]> {
+  async getVersions(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<PageVersion[]> {
     const sql = this.sql;
-    // v0.31.8 (D16): two-branch.
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      const rows = await sql`
+        SELECT pv.* FROM page_versions pv
+        JOIN pages p ON p.id = pv.page_id
+        WHERE p.slug = ${slug} AND p.source_id = ANY(${opts.sourceIds}::text[])
+        ORDER BY pv.snapshot_at DESC
+      `;
+      return rows as unknown as PageVersion[];
+    }
     if (opts?.sourceId) {
       const rows = await sql`
         SELECT pv.* FROM page_versions pv

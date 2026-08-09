@@ -6,6 +6,11 @@ import { LATEST_VERSION, getIdleBlockers } from '../core/migrate.ts';
 import { checkResolvable } from '../core/check-resolvable.ts';
 import { autoFixDryViolations, type AutoFixReport, type FixOutcome } from '../core/dry-fix.ts';
 import { autoDetectSkillsDirReadOnly } from '../core/repo-root.ts';
+import {
+  SKILLS_MANIFEST_FILENAME,
+  verifySkillsManifest,
+  type SkillsManifest,
+} from '../core/skills-integrity.ts';
 import { loadOrDeriveManifest } from '../core/skill-manifest.ts';
 import { parseSkillFrontmatter } from '../core/skill-frontmatter.ts';
 import {
@@ -47,6 +52,13 @@ import { lagFromContentMs } from '../core/source-health.ts';
 import { CHUNKER_VERSION } from '../core/chunkers/code.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../core/link-extraction.ts';
 import { isUndefinedColumnError } from '../core/utils.ts';
+import {
+  loadStorageConfig,
+  effectiveDbOnlyDirs,
+  DERIVE_PHASE_DB_ONLY_DEFAULTS,
+  findDbOnlyCollisions,
+} from '../core/storage-config.ts';
+import { slugifyPath } from '../core/sync.ts';
 // issue #1777: hidden_by_search_policy — count chunked pages withheld from
 // default search by the hard-exclude prefix policy. Reuses the canonical
 // exclude resolver + LIKE escaper + visibility clause so the doctor count can't
@@ -364,19 +376,38 @@ export async function jsonbIntegrityCheck(
   progress?: Pick<ProgressReporter, 'heartbeat'>,
 ): Promise<Check> {
   try {
-    const targets: Array<{ table: string; col: string; expected: 'object' | 'array' }> = [
-      { table: 'pages',         col: 'frontmatter',    expected: 'object' },
-      { table: 'raw_data',      col: 'data',           expected: 'object' },
-      { table: 'ingest_log',    col: 'pages_updated',  expected: 'array'  },
-      { table: 'files',         col: 'metadata',       expected: 'object' },
-      { table: 'page_versions', col: 'frontmatter',    expected: 'object' },
+    const targets: Array<{ table: string; col: string; expected: 'object' | 'array'; jsonPayloadOnly?: boolean }> = [
+      { table: 'pages',                    col: 'frontmatter',    expected: 'object' },
+      { table: 'raw_data',                 col: 'data',           expected: 'object' },
+      { table: 'ingest_log',               col: 'pages_updated',  expected: 'array'  },
+      { table: 'files',                    col: 'metadata',       expected: 'object' },
+      { table: 'page_versions',            col: 'frontmatter',    expected: 'object' },
+      // Subagent persistence — second double-encode site (historical damage
+      // rows from the pre-v0.42.53.0 positional bind; write paths fixed in
+      // #2375). Mirrors repair-jsonb's targets incl. jsonPayloadOnly: these
+      // columns can legitimately hold jsonb STRING scalars (persistToolExec
+      // binds pre-serialized string payloads as-is), so only JSON-container
+      // content counts as damage.
+      { table: 'subagent_messages',        col: 'content_blocks', expected: 'array',  jsonPayloadOnly: true },
+      { table: 'subagent_tool_executions', col: 'input',          expected: 'object', jsonPayloadOnly: true },
+      { table: 'subagent_tool_executions', col: 'output',         expected: 'object', jsonPayloadOnly: true },
     ];
     let totalBad = 0;
     const breakdown: string[] = [];
-    for (const { table, col } of targets) {
+    for (const { table, col, jsonPayloadOnly } of targets) {
       progress?.heartbeat(`jsonb_integrity.${table}.${col}`);
+      // Skip targets whose table doesn't exist on this brain (subagent_*
+      // tables are v0.15+; pre-v0.15 brains naturally lack them).
+      const existsRows = await engine.executeRaw<{ exists: boolean }>(
+        `SELECT to_regclass($1) IS NOT NULL AS exists`,
+        [table],
+      );
+      if (!existsRows[0]?.exists) continue;
+      const damage = jsonPayloadOnly
+        ? `jsonb_typeof(${col}) = 'string' AND (${col} #>> '{}') ~ '^[[:space:]]*[\\[{]' AND pg_input_is_valid(${col} #>> '{}', 'jsonb')`
+        : `jsonb_typeof(${col}) = 'string'`;
       const rows = await engine.executeRaw<{ n: number }>(
-        `SELECT count(*)::int AS n FROM ${table} WHERE jsonb_typeof(${col}) = 'string'`,
+        `SELECT count(*)::int AS n FROM ${table} WHERE ${damage}`,
       );
       const n = Number(rows[0]?.n ?? 0);
       if (n > 0) { totalBad += n; breakdown.push(`${table}.${col}=${n}`); }
@@ -3668,6 +3699,200 @@ export async function checkUnverifiedExtractions(
 }
 
 /**
+ * issue #2250 (reported by @615Works) — content_hash_duplicates.
+ *
+ * `gbrain import` run from the wrong root (one level too deep) drops the
+ * path prefix from every slug, leaving `people/x` and `x` coexisting with
+ * identical content. `dream --phase purge` never removes them (they aren't
+ * file-backed orphans) and nothing surfaced the condition. One GROUP BY —
+ * never an N² hash comparison — flags hash groups that contain BOTH a bare
+ * slug (no '/') and a path-prefixed slug.
+ */
+export async function checkContentHashDuplicates(engine: BrainEngine): Promise<Check> {
+  const name = 'content_hash_duplicates';
+  const fix = 'Fix: gbrain pages delete <bare-slug> for each pair, then gbrain pages purge-deleted --older-than 0';
+  try {
+    const rows = await engine.executeRaw<{ source_id: string; content_hash: string; slugs: string }>(
+      `SELECT source_id, content_hash,
+              string_agg(slug, '|' ORDER BY length(slug), slug) AS slugs
+         FROM pages
+        WHERE deleted_at IS NULL AND content_hash IS NOT NULL AND content_hash <> ''
+        GROUP BY source_id, content_hash
+       HAVING count(*) > 1
+          AND count(*) FILTER (WHERE strpos(slug, '/') = 0) > 0
+          AND count(*) FILTER (WHERE strpos(slug, '/') > 0) > 0
+        LIMIT 50`,
+    );
+    if (rows.length === 0) {
+      return { name, status: 'ok', message: 'No content-hash duplicate pairs (bare vs path-prefixed slugs)' };
+    }
+    let pairCount = 0;
+    const samples: string[] = [];
+    for (const r of rows) {
+      const slugs = String(r.slugs).split('|');
+      const prefixed = slugs.filter(s => s.includes('/'));
+      for (const bare of slugs.filter(s => !s.includes('/'))) {
+        const twin = prefixed.find(p => p.endsWith('/' + bare)) ?? prefixed[0];
+        pairCount++;
+        if (samples.length < 5) samples.push(`${bare} <-> ${twin}`);
+      }
+    }
+    return {
+      name,
+      status: 'warn',
+      message: `${pairCount} content-hash duplicate pair(s) detected (same content, differing slug forms — usually an import run from the wrong root, which drops the path prefix). Sample: ${samples.join('; ')}. ${fix}`,
+      details: { pair_count: pairCount, hash_groups: rows.length, sample_pairs: samples },
+    };
+  } catch (e) {
+    return { name, status: 'warn', message: `Could not check content-hash duplicates: ${(e as Error).message}` };
+  }
+}
+
+/** Walk a repo for markdown files and return their slugified (lowercased) slugs. */
+function collectMarkdownSlugs(root: string): Set<string> {
+  const out = new Set<string>();
+  const stack = [''];
+  while (stack.length > 0) {
+    const rel = stack.pop()!;
+    let entries;
+    try {
+      entries = readdirSync(rel ? join(root, rel) : root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      // Hidden directories can contain canonical, tracked knowledge (for
+      // example `.archive/`). Only implementation metadata is never a page.
+      if (e.name === '.git' || e.name === 'node_modules') continue;
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) stack.push(childRel);
+      else if (/\.mdx?$/i.test(e.name)) out.add(slugifyPath(childRel).toLowerCase());
+    }
+  }
+  return out;
+}
+
+/**
+ * issue #2784 (reported by @alexputici) — undeclared_db_only_pages.
+ *
+ * A markdown page with no backing file that sits outside every declared
+ * db_only path is invisible to any file-lane backup/recovery reasoning: an
+ * operator auditing "what would survive a DB loss" gets a silently wrong
+ * answer. The engine's own derive-phase output prefixes
+ * (DERIVE_PHASE_DB_ONLY_DEFAULTS) count as implicitly declared so the check
+ * stays quiet on healthy brains. Deliberately allowed to stat the source
+ * repo (the one thing the SQL-only check registry could never see).
+ */
+export async function checkUndeclaredDbOnlyPages(engine: BrainEngine): Promise<Check> {
+  const name = 'undeclared_db_only_pages';
+  try {
+    const sources = await engine.executeRaw<{ id: string; local_path: string | null }>(
+      `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL`,
+    );
+    const checkable = sources.filter(s => s.local_path && existsSync(s.local_path));
+    if (checkable.length === 0) {
+      return { name, status: 'ok', message: 'Not applicable (no sources with a local repo path on this host)' };
+    }
+    let total = 0;
+    const samples: string[] = [];
+    const perSource: Record<string, number> = {};
+    for (const src of checkable) {
+      let declared: string[] = [];
+      try {
+        declared = loadStorageConfig(src.local_path)?.db_only ?? [];
+      } catch {
+        // invalid gbrain.yml — treated as no declarations; the sync path
+        // already surfaces the config error itself.
+      }
+      const dbOnlyDirs = effectiveDbOnlyDirs(declared);
+      const rows = await engine.executeRaw<{ slug: string }>(
+        `SELECT slug FROM pages WHERE deleted_at IS NULL AND source_id = $1 AND page_kind = 'markdown'`,
+        [src.id],
+      );
+      if (rows.length === 0) continue;
+      const backed = collectMarkdownSlugs(src.local_path!);
+      for (const { slug } of rows) {
+        if (dbOnlyDirs.some(dir => slug.startsWith(dir))) continue;
+        if (backed.has(slug)) continue;
+        total++;
+        perSource[src.id] = (perSource[src.id] ?? 0) + 1;
+        if (samples.length < 5) samples.push(`${slug} (src=${src.id})`);
+      }
+    }
+    if (total === 0) {
+      return {
+        name,
+        status: 'ok',
+        message: `Every DB page is file-backed or under a declared/default db_only path (derive-phase defaults: ${DERIVE_PHASE_DB_ONLY_DEFAULTS.join(' ')})`,
+      };
+    }
+    return {
+      name,
+      status: 'warn',
+      message: `${total} DB page(s) have no backing file and sit outside every declared/default db_only path — invisible to file-lane backup/recovery. Sample: ${samples.join('; ')}. Fix: restore or export the files, or declare their prefixes under storage.db_only in gbrain.yml (derive-phase defaults already cover: ${DERIVE_PHASE_DB_ONLY_DEFAULTS.join(' ')})`,
+      details: { total, per_source: perSource, sample_slugs: samples },
+    };
+  } catch (e) {
+    return { name, status: 'warn', message: `Could not check undeclared db-only pages: ${(e as Error).message}` };
+  }
+}
+
+/**
+ * issue #2788 (reported by @alexputici) — db_only_collector_collision.
+ *
+ * Declaring a collector's output dir in storage.db_only silently kills its
+ * ingestion: manageGitignore auto-gitignores the dir, the git-walking sync
+ * never sees the files, and import honors .gitignore too — everything stays
+ * green while nothing reaches the DB (a 7-week outage in the field). The
+ * recipe's `output_paths` frontmatter is the ground truth; the same warning
+ * also fires at .gitignore-write time inside sync's manageGitignore.
+ */
+export async function checkDbOnlyCollectorCollision(
+  engine: BrainEngine,
+  opts?: { collectors?: Array<{ id: string; output_path: string }> },
+): Promise<Check> {
+  const name = 'db_only_collector_collision';
+  try {
+    let collectors = opts?.collectors;
+    if (!collectors) {
+      const { getConfiguredCollectorOutputs } = await import('./integrations.ts');
+      collectors = getConfiguredCollectorOutputs();
+    }
+    if (collectors.length === 0) {
+      return { name, status: 'ok', message: 'No configured collectors declare output paths' };
+    }
+    const sources = await engine.executeRaw<{ id: string; local_path: string | null }>(
+      `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL`,
+    );
+    const hits: string[] = [];
+    for (const src of sources) {
+      if (!src.local_path || !existsSync(src.local_path)) continue;
+      let dbOnly: string[] = [];
+      try {
+        dbOnly = loadStorageConfig(src.local_path)?.db_only ?? [];
+      } catch {
+        continue;
+      }
+      if (dbOnly.length === 0) continue;
+      for (const hit of findDbOnlyCollisions(collectors, dbOnly)) {
+        hits.push(`collector '${hit.id}' writes to '${hit.output_path}' which is inside db_only path '${hit.db_only_dir}' (source ${src.id})`);
+      }
+    }
+    if (hits.length === 0) {
+      return { name, status: 'ok', message: 'No collector output dir falls inside a db_only path' };
+    }
+    return {
+      name,
+      status: 'warn',
+      message: `${hits.length} collector/db_only collision(s): ${hits.join('; ')}. db_only dirs are auto-gitignored, so sync AND import silently skip files there — the collector runs green while nothing reaches the DB. Fix: remove the prefix from storage.db_only in gbrain.yml, or move the collector output.`,
+      details: { collisions: hits },
+    };
+  } catch (e) {
+    return { name, status: 'warn', message: `Could not check collector/db_only collisions: ${(e as Error).message}` };
+  }
+}
+
+/**
  * issue #1678 — extract_atoms_backlog doctor check.
  *
  * Closes the "silent backlog" gap: extract_atoms is pack-gated, so on a brain
@@ -4445,6 +4670,96 @@ export async function checkCycleFreshness(
  *   - `progress` reporter writes to stderr (heartbeats per check)
  *   - `engine.executeRaw` / handler-leaf calls (the actual probe work)
  */
+// ≥2 failed repair attempts inside 7 days = the corruption keeps regenerating.
+const REPAIR_RECURRENCE_WINDOW_MS = 7 * 24 * 3600 * 1000;
+const REPAIR_RECURRENCE_THRESHOLD = 2;
+
+/**
+ * WAL-repair wave (#223/#1670/#2575): when the DB failed to connect on a
+ * PGLite brain, diagnose the data dir from the FILESYSTEM (the connect error
+ * itself was swallowed by doctor's fs-only fallback — this check re-derives
+ * the state from disk). Pure: interprets an `inspectPgliteDataDir` diagnosis
+ * into a Check; exported so `test/doctor-pglite-datadir.test.ts` drives it
+ * directly (same convention as computeWorkerOomLoopCheck). Returns a Check
+ * always — the call site only runs it when connect already failed, so even a
+ * healthy-looking dir warrants a pointer at the repair tooling.
+ *
+ * Recurrence escalation (eng-review 2A): repeated failed repair attempts on
+ * record mean the corruption keeps regenerating (unclean-shutdown genesis) —
+ * escalate to the engine-switch ladder instead of letting the brain silently
+ * lose a WAL tail per cycle. Backup-dir inventory rides along (same
+ * disk-visibility class as orphan_clones).
+ */
+export function computePgliteDataDirCheck(
+  dataDir: string,
+  diagnosis: import('../core/pglite-repair.ts').PgliteDirDiagnosis,
+): Check {
+  const backupNote = diagnosis.backupDirs.length > 0
+    ? ` ${diagnosis.backupDirs.length} repair backup dir(s) on disk (newest: ${diagnosis.backupDirs[0]}) — delete old ones to reclaim space once the brain is healthy.`
+    : '';
+  // Count BOTH outcomes (adversarial review F12): a >1h-period crash loop where
+  // each repair "succeeds" discards a WAL tail per cycle with zero FAILED
+  // attempts on record — escalation must still fire.
+  const recentAttempts = diagnosis.recentAttempts.filter(
+    (a) => Date.now() - a.ts < REPAIR_RECURRENCE_WINDOW_MS,
+  ).length;
+  const recurrence = recentAttempts >= REPAIR_RECURRENCE_THRESHOLD
+    ? ` Auto-repair has run ${recentAttempts}x this week — the corruption keeps regenerating (likely an unclean-shutdown loop). Consider switching engines (docs/ENGINES.md: \`gbrain init --supabase\` or native Postgres).`
+    : '';
+
+  switch (diagnosis.verdict) {
+    case 'locked':
+      return {
+        name: 'pglite_data_dir',
+        status: 'warn',
+        message:
+          `Could not connect, and the PGLite data-dir lock is held by live PID ${diagnosis.lockHolderPid} — ` +
+          `another gbrain process (often \`gbrain serve\`) has the brain open. Stop it and re-run.${backupNote}`,
+        remediation_status: 'human_only',
+      };
+    case 'missing':
+      return {
+        name: 'pglite_data_dir',
+        status: 'warn',
+        message: `No PGLite data dir at ${dataDir}. Run \`gbrain init --pglite\` to create one.`,
+        remediation_status: 'human_only',
+      };
+    case 'unsupported-layout':
+      return {
+        name: 'pglite_data_dir',
+        status: 'fail',
+        message:
+          `PGLite data dir at ${dataDir} is not repairable in place (${diagnosis.detail}). ` +
+          `Rebuild from your brain repo: \`gbrain reinit-pglite\` (or back up ~/.gbrain, move the dir aside, ` +
+          `\`gbrain init --pglite\`, re-add sources + sync + embed).${backupNote}${recurrence}`,
+        remediation_status: 'human_only',
+      };
+    case 'wal-corruption-likely':
+      return {
+        name: 'pglite_data_dir',
+        status: 'fail',
+        message:
+          `PGLite failed to open and the data dir shows unclean-shutdown state (${diagnosis.detail}). ` +
+          `This is the torn-WAL class behind issue #223 — repairable in place, data preserved: ` +
+          `\`gbrain pglite-repair --dry-run\` to diagnose, \`gbrain pglite-repair --yes\` to repair.${backupNote}${recurrence}`,
+        remediation_status: 'human_only',
+      };
+    case 'looks-healthy':
+    default:
+      return {
+        name: 'pglite_data_dir',
+        status: 'fail',
+        message:
+          `PGLite failed to open but the data dir layout validates (${diagnosis.detail}). ` +
+          `IF the connect error mentions \`Aborted()\` this is likely torn WAL state — ` +
+          `\`gbrain pglite-repair --dry-run\` to diagnose, \`gbrain pglite-repair --yes\` to repair in place ` +
+          `(repair discards the un-checkpointed WAL tail — don't run it for lock-contention or ` +
+          `catalog-corruption errors; 58P01/pgvector load failures need \`gbrain reinit-pglite\` instead).${backupNote}${recurrence}`,
+        remediation_status: 'human_only',
+      };
+  }
+}
+
 /**
  * issue #1685 (GAP A) — the single authoritative "worker is OOM-looping" signal.
  *
@@ -4843,6 +5158,15 @@ export async function buildChecks(
   // SKILL group — gated.
   if (scope === 'all' && skillsDir) {
     checks.push(skillBrainFirstCheck(skillsDir));
+  }
+
+  // 2c. Skills manifest integrity (#159): tamper-evidence, not signatures.
+  // Compares the skills tree against its committed skills.lock.json and
+  // WARNS on drift — never fails, never blocks. No manifest (e.g. a user
+  // workspace skills dir, or a compiled binary far from the repo) → ok/skip.
+  // SKILL group — gated.
+  if (scope === 'all' && skillsDir) {
+    checks.push(skillsManifestIntegrityCheck(skillsDir));
   }
 
   // 3. Half-migrated Minions detection (filesystem-only).
@@ -5730,6 +6054,27 @@ export async function buildChecks(
     }
   } catch {
     // Filesystem read failure is non-fatal.
+  }
+
+  // 3d. PGLite data-dir diagnosis (WAL-repair wave). Only meaningful when the
+  // connect already FAILED on a PGLite brain (engine === null): the connect
+  // error was swallowed by the fs-only fallback, so this check re-derives the
+  // dir state from disk and names the repair ladder. Skipped under --fast
+  // (connect wasn't attempted, so "engine === null" proves nothing there).
+  if (!fastMode && !engine) {
+    try {
+      const cfg = loadConfig();
+      if (cfg?.engine === 'pglite') {
+        const { inspectPgliteDataDir } = await import('../core/pglite-repair.ts');
+        const { resolve } = await import('node:path');
+        // Absolutize: a RELATIVE database_path would make the sidecar/backup
+        // lookups resolve against doctor's cwd instead of the engine's.
+        const pgliteDataDir = resolve(cfg.database_path || gbrainPath('brain.pglite'));
+        checks.push(computePgliteDataDirCheck(pgliteDataDir, inspectPgliteDataDir(pgliteDataDir)));
+      }
+    } catch {
+      // Best-effort: an unreadable config or fs failure must not stop doctor.
+    }
   }
 
   // --- DB checks (skip if --fast or no engine) ---
@@ -7682,6 +8027,14 @@ export async function buildChecks(
     // per-source dispatch gate sees.
     progress.heartbeat('cycle_freshness');
     checks.push(await checkCycleFreshness(engine));
+    // Silent-failure batch (#2250 / #2784 / #2788): wrong-root import
+    // duplicates, undeclared DB-only pages, collector-output-in-db_only.
+    progress.heartbeat('content_hash_duplicates');
+    checks.push(await checkContentHashDuplicates(engine));
+    progress.heartbeat('undeclared_db_only_pages');
+    checks.push(await checkUndeclaredDbOnlyPages(engine));
+    progress.heartbeat('db_only_collector_collision');
+    checks.push(await checkDbOnlyCollectorCollision(engine));
   }
 
   // v0.32.3 search-lite — mode + eval_drift surfaces. Status stays 'ok' per
@@ -7916,6 +8269,51 @@ export function skillConformanceCheck(skillsDir: string): Check {
  * Test seam: pure function, no `process.exit`. Direct call from tests
  * with a synthetic skills dir under tempdir.
  */
+/**
+ * Skills-manifest integrity check (#159). Verifies the skills tree against
+ * the committed skills.lock.json tamper-evidence manifest. Advisory only:
+ * drift is a WARN (local edits are legitimate), and a missing/unreadable
+ * manifest is an ok/skip — a user's workspace skills dir or a compiled
+ * binary far from the repo has no manifest, and that is not a problem.
+ */
+export function skillsManifestIntegrityCheck(skillsDir: string): Check {
+  const name = 'skills_manifest_integrity';
+  const manifestPath = join(skillsDir, SKILLS_MANIFEST_FILENAME);
+  if (!existsSync(manifestPath)) {
+    return { name, status: 'ok', message: `No ${SKILLS_MANIFEST_FILENAME} in ${skillsDir} — integrity check not applicable` };
+  }
+  let drift: ReturnType<typeof verifySkillsManifest>;
+  let tracked: number;
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as SkillsManifest;
+    tracked = Object.keys(manifest).length;
+    drift = verifySkillsManifest(skillsDir, manifest);
+  } catch (err) {
+    // Fail-safe: an unreadable/unparseable manifest or a filesystem error
+    // skips the check rather than warning — this check must never block.
+    const msg = err instanceof Error ? err.message : String(err);
+    return { name, status: 'ok', message: `Could not verify ${SKILLS_MANIFEST_FILENAME} (${msg}) — integrity check skipped` };
+  }
+  const total = drift.modified.length + drift.missing.length + drift.extra.length;
+  if (total === 0) {
+    return { name, status: 'ok', message: `${tracked} bundled skill files match ${SKILLS_MANIFEST_FILENAME}` };
+  }
+  const sample = (files: string[]): string =>
+    files.slice(0, 5).join(', ') + (files.length > 5 ? `, … +${files.length - 5} more` : '');
+  const parts: string[] = [];
+  if (drift.modified.length > 0) parts.push(`${drift.modified.length} modified (${sample(drift.modified)})`);
+  if (drift.missing.length > 0) parts.push(`${drift.missing.length} missing (${sample(drift.missing)})`);
+  if (drift.extra.length > 0) parts.push(`${drift.extra.length} extra (${sample(drift.extra)})`);
+  return {
+    name,
+    status: 'warn',
+    message:
+      `skills/ drifted from ${SKILLS_MANIFEST_FILENAME} (advisory — local edits are fine): ${parts.join('; ')}. ` +
+      `If intentional, regenerate: bun run scripts/generate-skills-manifest.ts`,
+    details: { modified: drift.modified, missing: drift.missing, extra: drift.extra },
+  };
+}
+
 export function skillBrainFirstCheck(skillsDir: string): Check {
   let manifest: ReturnType<typeof loadOrDeriveManifest>;
   try {

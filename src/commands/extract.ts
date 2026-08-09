@@ -43,7 +43,7 @@ import {
 } from '../core/link-extraction.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
-import { pathToSlug, pruneDir, isSyncable } from '../core/sync.ts';
+import { pathToSlug, slugifyPath, pruneDir, isSyncable } from '../core/sync.ts';
 // v0.41.18.0: withRetry + isRetryableConnError + WithRetryOpts moved to
 // src/core/retry.ts as the canonical primitive. Engine methods
 // (addLinksBatch/addTimelineEntriesBatch/upsertChunks) now self-retry via
@@ -269,14 +269,24 @@ export function extractMarkdownLinks(content: string): { name: string; relTarget
 export function resolveSlug(fileDir: string, relTarget: string, allSlugs: Set<string>): string | null {
   const targetNoExt = relTarget.endsWith('.md') ? relTarget.slice(0, -3) : relTarget;
 
-  const s1 = join(fileDir, targetNoExt);
-  if (allSlugs.has(s1)) return s1;
+  // Issue #1964: wikilinks carry raw Obsidian paths (`[[llm-wiki/entities/AI 3.0]]`)
+  // but allSlugs holds sync-slugified slugs (`llm-wiki/entities/ai-3.0`). Try the
+  // raw candidate first (back-compat), then the sync-consistent slugified form.
+  const hit = (candidate: string): string | null => {
+    if (allSlugs.has(candidate)) return candidate;
+    const slugified = slugifyPath(candidate);
+    if (slugified !== candidate && allSlugs.has(slugified)) return slugified;
+    return null;
+  };
+
+  const s1 = hit(join(fileDir, targetNoExt));
+  if (s1) return s1;
 
   const parts = fileDir.split('/').filter(Boolean);
   for (let strip = 1; strip <= parts.length; strip++) {
     const ancestor = parts.slice(0, parts.length - strip).join('/');
-    const candidate = ancestor ? join(ancestor, targetNoExt) : targetNoExt;
-    if (allSlugs.has(candidate)) return candidate;
+    const candidate = hit(ancestor ? join(ancestor, targetNoExt) : targetNoExt);
+    if (candidate) return candidate;
   }
 
   return null;
@@ -662,7 +672,43 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
   return result;
 }
 
+const EXTRACT_HELP = `Usage: gbrain extract <subcommand> [flags]
+
+Extraction:
+  gbrain extract links    [--source fs|db] [--source-id <id>] [--dir <brain-dir>]
+                          [--type T] [--since DATE] [--include-frontmatter]
+                          [--workers N|--concurrency N] [--dry-run] [--json]
+  gbrain extract timeline [--source fs|db] [--source-id <id>] [--dir <brain-dir>]
+                          [--type T] [--since DATE] [--include-frontmatter]
+                          [--infer-dates] [--workers N|--concurrency N]
+                          [--dry-run] [--json]
+  gbrain extract all      [--source fs|db] [--source-id <id>] [--dir <brain-dir>]
+                          [--type T] [--since DATE] [--include-frontmatter]
+                          [--infer-dates] [--workers N|--concurrency N]
+                          [--dry-run] [--json]
+  gbrain extract <links|timeline> --by-mention --source db
+  gbrain extract <links|timeline|all> --ner --source db
+  gbrain extract <timeline|all> --from-meetings --source db
+
+Incremental sweep:
+  gbrain extract --stale [--source-id <id>] [--include-frontmatter]
+                         [--catch-up] [--dry-run] [--json]
+      Re-extract links + timeline only for stale pages. DB-source; safe to
+      cron. --catch-up loops past the 30-minute budget until none remain.
+
+Inspection:
+  gbrain extract --explain <kind> [--json]
+  gbrain extract benchmark --pack <name> --kind <type> [--json]
+
+Status:
+  gbrain extract status [--source-id ID] [--kind X] [--verbose] [--json]`;
+
 export async function runExtract(engine: BrainEngine, args: string[]) {
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(EXTRACT_HELP);
+    return;
+  }
+
   const subcommand = args[0];
 
   // v0.42 Wave C+D dispatch — new operator surfaces. These intercept
@@ -790,32 +836,7 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   }
 
   if (!subcommand || !['links', 'timeline', 'all'].includes(subcommand)) {
-    console.error(`Usage: gbrain extract <subcommand> [flags]
-
-Extraction (existing):
-  gbrain extract links    [--source fs|db] [--source-id <id>] [--dir <brain-dir>] [--dry-run] [--json] [--type T] [--since DATE] [--workers N]
-  gbrain extract timeline [--source fs|db] [--source-id <id>] [--dir <brain-dir>] [--dry-run] [--json] [--type T] [--since DATE] [--workers N]
-  gbrain extract all      [--source fs|db] [--source-id <id>] [--dir <brain-dir>] [--dry-run] [--json] [--type T] [--since DATE] [--workers N]
-  gbrain extract <links|timeline> --by-mention --source db
-  gbrain extract <links|timeline|all> --ner --source db
-  gbrain extract <timeline|all> --from-meetings
-
-Incremental sweep (v0.42.7):
-  gbrain extract --stale [--source-id <id>] [--catch-up] [--dry-run] [--json]
-      Re-extract links + timeline ONLY for pages whose extraction is stale
-      (never extracted, edited since, or extractor bumped). DB-source; safe to
-      cron. --catch-up loops past the 30-min wall-clock budget until 0 remain.
-
-Inspection (v0.42):
-  gbrain extract --explain <kind> [--json]
-      Print resolution chain for one pack-declared extractable kind.
-  gbrain extract benchmark --pack <name> --kind <type> [--json]
-      Run a pack's fixture corpus through the extractor (v0.42 reports
-      fixture shape; LLM dispatch comes in v0.43+).
-
-Status (v0.42):
-  gbrain extract status [--source-id ID] [--kind X] [--verbose] [--json]
-      Per-kind 7-day rollup: cost, halt rate, eval pass/fail counts.`);
+    console.error(EXTRACT_HELP);
     process.exit(1);
   }
 
@@ -1458,6 +1479,8 @@ async function extractLinksFromDB(
     slugToSources.set(ref.slug, list);
   }
   let processed = 0, created = 0;
+  // #2576: skipped-candidate counter — see extractStaleFromDB's twin.
+  let skippedMissingTarget = 0;
   // v0.42.7 (#1696): pages whose links we extracted this run — stamped after
   // the loop so a manual `gbrain extract links|all --source db` clears the
   // links_extraction_lag doctor signal. Non-dry-run only.
@@ -1514,7 +1537,7 @@ async function extractLinksFromDB(
       // endpoint-validation + from/to source-id picking (null = skip: missing
       // endpoint OR target only in a non-origin/non-default source).
       const resolved = resolveCandidateSources(c, slug, source_id, allSlugs, slugToSources);
-      if (!resolved) continue;
+      if (!resolved) { skippedMissingTarget++; continue; }
       const { fromSlug, fromSourceId, toSourceId } = resolved;
 
       if (dryRunSeen) {
@@ -1571,6 +1594,9 @@ async function extractLinksFromDB(
   if (!jsonMode) {
     const label = dryRun ? '(dry run) would create' : 'created';
     console.log(`Links: ${label} ${created} from ${processed} pages (db source)`);
+    if (skippedMissingTarget > 0) {
+      console.log(`Skipped ${skippedMissingTarget} candidate(s) whose target page doesn't exist (references to non-pages are never persisted).`);
+    }
     if (includeFrontmatter && unresolved.length > 0) {
       // Top-20 preview of unresolvable frontmatter names so the user can
       // see where the graph has holes (codex tension 6.4).
@@ -1716,7 +1742,7 @@ export async function extractStaleFromDB(
     sourceIdFilter?: string;
     catchUp: boolean;
   },
-): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number }> {
+): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number; skippedMissingTarget?: number }> {
   const { dryRun, jsonMode, includeFrontmatter, sourceIdFilter, catchUp } = opts;
   const versionTs = LINK_EXTRACTOR_VERSION_TS;
 
@@ -1768,6 +1794,10 @@ export async function extractStaleFromDB(
   let afterPageId = 0;
   let linksCreated = 0, timelineCreated = 0, pagesProcessed = 0;
   let budgetHit = false;
+  // #2576: candidates whose endpoint pages don't exist are skipped, not
+  // persisted. Counted so a dropped reference is observable in the summary
+  // instead of vanishing silently (the failure mode that hid bug 2).
+  let skippedMissingTarget = 0;
 
   for (;;) {
     const rows = await engine.listStalePagesForExtraction({
@@ -1787,7 +1817,7 @@ export async function extractStaleFromDB(
       );
       for (const c of extracted.candidates) {
         const r = resolveCandidateSources(c, page.slug, page.source_id, allSlugs, slugToSources);
-        if (!r) continue;
+        if (!r) { skippedMissingTarget++; continue; }
         linkRows.push({
           from_slug: r.fromSlug, to_slug: c.targetSlug, link_type: c.linkType,
           context: c.context, link_source: c.linkSource, origin_slug: c.originSlug,
@@ -1848,6 +1878,9 @@ export async function extractStaleFromDB(
 
   if (!jsonMode) {
     console.log(`Extract --stale: ${linksCreated} link(s) + ${timelineCreated} timeline entr(ies) from ${pagesProcessed} page(s).`);
+    if (skippedMissingTarget > 0) {
+      console.log(`Skipped ${skippedMissingTarget} candidate(s) whose target page doesn't exist (references to non-pages are never persisted).`);
+    }
     if (budgetHit && staleRemaining > 0) {
       console.log(`Time budget reached — ${staleRemaining} page(s) still stale. Re-run 'gbrain extract --stale' (or pass --catch-up) to continue.`);
     }
@@ -1855,9 +1888,10 @@ export async function extractStaleFromDB(
     process.stdout.write(JSON.stringify({
       action: 'extract_stale_done', links_created: linksCreated, timeline_created: timelineCreated,
       pages_processed: pagesProcessed, stale_remaining: staleRemaining, budget_hit: budgetHit,
+      skipped_missing_target: skippedMissingTarget,
     }) + '\n');
   }
-  return { linksCreated, timelineCreated, pagesProcessed, staleRemaining };
+  return { linksCreated, timelineCreated, pagesProcessed, staleRemaining, skippedMissingTarget };
 }
 
 /**
