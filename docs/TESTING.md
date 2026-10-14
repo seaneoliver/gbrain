@@ -423,14 +423,6 @@ Test command tiers, each with a clear scope:
 | `bun run test:profile` | Reads a captured `bun test` log on stdin and prints the N slowest tests (`-n N`, default 10): `bun test 2>&1 \| bun run test:profile`. | seconds | Finding slow tests to fix or demote to `*.slow.test.ts`. |
 | `bun run test:admin` | Pinned Playwright Chromium tests for the production embedded admin UI, served with an isolated temporary home/cwd and in-memory PGLite. Exercises owner login, OAuth consent, registration, setup, and lifecycle actions. | seconds-to-minutes | When touching the admin browser flow; required `admin-browser` CI job. |
 
-Upstream Linux workflows use Ubicloud runners. Forks use GitHub-hosted
-Ubuntu runners by default, with ARM jobs kept on native ARM runners; no
-Ubicloud runner registration is needed. macOS and Windows targets retain
-their existing runner labels.
-
-The local Docker gate builds admin assets inside its isolated `admin/dist`
-volume before compiling the CLI, including on a fresh or stale volume.
-
 For the admin browser lane, install frozen dependencies in the repository and
 `admin/`, run `bunx playwright install --with-deps chromium` on Linux, then run
 `bun run build:admin` before `bun run test:admin`. Tests live in
