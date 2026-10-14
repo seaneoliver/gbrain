@@ -15,13 +15,11 @@
  * codex D4 catch simplification.
  */
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'fs';
-import { join } from 'path';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { doctorSource } from './helpers/doctor-source.ts';
 
-const DOCTOR_SOURCE = readFileSync(
-  join(__dirname, '..', 'src', 'commands', 'doctor.ts'),
-  'utf8',
-);
+const DOCTOR_SOURCE = doctorSource();
 const FRONTMATTER_HEAVY_SCRIPT = readFileSync(
   join(__dirname, '..', 'tests', 'heavy', 'frontmatter_scan_wallclock.sh'),
   'utf8',
