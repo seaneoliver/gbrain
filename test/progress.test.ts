@@ -1,6 +1,12 @@
 import { describe, test, expect } from 'bun:test';
-import { PassThrough } from 'node:stream';
+import { spawn, type ChildProcessByStdio } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { PassThrough, type Readable } from 'node:stream';
 import { createProgress, startHeartbeat, __liveReporterCountForTest, __signalHandlerInstalledForTest } from '../src/core/progress.ts';
+
+const REPO = join(import.meta.dir, '..');
+type SigintHarnessProcess = ChildProcessByStdio<null, Readable, Readable>;
 
 /** Collect everything a reporter writes into a string. */
 function sink(isTTY = false): { stream: PassThrough & { isTTY?: boolean }; read: () => string } {
@@ -16,6 +22,84 @@ function parseJsonl(raw: string): Record<string, unknown>[] {
     .split('\n')
     .filter((l) => l.length > 0)
     .map((l) => JSON.parse(l));
+}
+
+function waitForStdoutMarker(proc: SigintHarnessProcess, marker: string, readStdout: () => string, timeoutMs = 3000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timeout);
+      proc.stdout.off('data', onData);
+      proc.off('exit', onExit);
+      proc.off('error', onError);
+    };
+    const onData = () => {
+      if (!readStdout().includes(marker)) return;
+      cleanup();
+      resolve();
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      reject(new Error(`child exited before ${marker}: code=${code} signal=${signal}`));
+    };
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error(`timed out waiting for ${marker}; stdout=${JSON.stringify(readStdout())}`));
+    }, timeoutMs);
+
+    proc.stdout.on('data', onData);
+    proc.once('exit', onExit);
+    proc.once('error', onError);
+    onData();
+  });
+}
+
+function waitForExit(proc: SigintHarnessProcess, timeoutMs = 1500): Promise<{ exited: boolean; code: number | null; signal: NodeJS.Signals | null }> {
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      clearTimeout(timeout);
+      proc.off('exit', onExit);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      resolve({ exited: true, code, signal });
+    };
+    const timeout = setTimeout(() => {
+      cleanup();
+      resolve({ exited: false, code: null, signal: null });
+    }, timeoutMs);
+    proc.once('exit', onExit);
+  });
+}
+
+async function runSigintHarness(script: string): Promise<{
+  exited: boolean;
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+}> {
+  const proc = spawn(process.execPath, ['-e', script], {
+    cwd: REPO,
+    env: { ...process.env, FORCE_COLOR: '0' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  proc.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
+  proc.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+
+  await waitForStdoutMarker(proc, 'READY\n', () => stdout);
+  proc.kill('SIGINT');
+  const result = await waitForExit(proc);
+  if (!result.exited) {
+    proc.kill('SIGKILL');
+    await waitForExit(proc);
+  }
+  return { ...result, stdout, stderr };
 }
 
 describe('progress reporter', () => {
@@ -62,7 +146,69 @@ describe('progress reporter', () => {
     expect(events[1]).toMatchObject({ event: 'tick', phase: 'doctor.jsonb_integrity', done: 1, total: 4 });
     expect(events[1].pct).toBe(25);
     expect(typeof events[1].elapsed_ms).toBe('number');
+    expect(typeof events[1].cpu_ms).toBe('number');
     expect(events[events.length - 1]).toMatchObject({ event: 'finish', phase: 'doctor.jsonb_integrity' });
+  });
+
+  test('json tick cpu_ms counts CPU work since the phase started, not time spent waiting', () => {
+    // Under a hypervisor whose guest kernel lacks CONFIG_PARAVIRT_TIME_ACCOUNTING (Ubuntu's generic kernels, the CI
+    // runners included), vCPU time the host steals is billed to whichever thread was current, so a steal burst that
+    // starts right after the wait wakes lands in this thread's CPU clock (run 38467234783: 268 ms billed inside a
+    // 200 ms wait on a runner with 28 % steal). Such a window is an invalid instrument reading, not CPU work: the
+    // measurement is repeated until the VM-wide steal counter did not move across it, and the bound below is
+    // asserted only on that window. Without /proc/stat (macOS) the first window is asserted as before.
+    const stealJiffies = (): number | null => {
+      try {
+        const cpuLine = readFileSync('/proc/stat', 'utf8').split('\n')[0] ?? '';
+        const fields = cpuLine.trim().split(/\s+/);
+        return fields[0] === 'cpu' && fields.length > 8 ? Number(fields[8]) : null;
+      } catch {
+        return null;
+      }
+    };
+    const cpuMs = () => { const u = process.threadCpuUsage(); return (u.user + u.system) / 1000; };
+    const measure = () => {
+      const { stream, read } = sink(false);
+      const p = createProgress({ mode: 'json', stream, minIntervalMs: 0, minItems: 1 });
+      p.start('import.files', 3);
+      const spinUntil = cpuMs() + 60;
+      while (cpuMs() < spinUntil) { /* burn 60 ms of CPU */ }
+      p.tick(1);
+      const stealBefore = stealJiffies();
+      const usageBefore = process.resourceUsage();
+      const cpuBeforeWait = cpuMs();
+      // Block the thread for 200 ms without yielding: an await would let other queued main-thread work (an earlier
+      // test's timer, a GC pause) run and be billed to the phase, and the test means "the thread sat idle".
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+      const cpuInWait = cpuMs() - cpuBeforeWait;
+      const usageAfter = process.resourceUsage();
+      p.tick(1);
+      p.finish();
+      const stealAfter = stealJiffies();
+      const [, worked, waited] = parseJsonl(read()) as Array<{ cpu_ms: number; elapsed_ms: number }>;
+      const stealMs = stealBefore === null || stealAfter === null ? null : (stealAfter - stealBefore) * 10;
+      return { worked, waited, cpuInWait, usageBefore, usageAfter, stealMs };
+    };
+    const attempts: ReturnType<typeof measure>[] = [];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      attempts.push(measure());
+      if (attempts[attempts.length - 1]!.stealMs === null || attempts[attempts.length - 1]!.stealMs === 0) break;
+    }
+    const { worked, waited, cpuInWait, usageBefore, usageAfter, stealMs } = attempts[attempts.length - 1]!;
+    expect(worked.cpu_ms).toBeGreaterThanOrEqual(60);
+    expect(waited.elapsed_ms - worked.elapsed_ms).toBeGreaterThanOrEqual(190);
+    const waitedCpuMs = waited.cpu_ms - worked.cpu_ms;
+    expect(
+      waitedCpuMs,
+      `the second tick billed ${waitedCpuMs.toFixed(1)} ms of thread CPU (first tick, after the 60 ms spin: ${worked.cpu_ms.toFixed(1)} ms): ` +
+        `${cpuInWait.toFixed(1)} ms inside the 200 ms Atomics.wait, ${(waitedCpuMs - cpuInWait).toFixed(1)} ms in the tick calls around it; ` +
+        `process during the wait: ${usageAfter.minorPageFault - usageBefore.minorPageFault} minor and ` +
+        `${usageAfter.majorPageFault - usageBefore.majorPageFault} major page faults, ` +
+        `${usageAfter.involuntaryContextSwitches - usageBefore.involuntaryContextSwitches} involuntary context switches, ` +
+        `${((usageAfter.userCPUTime + usageAfter.systemCPUTime - usageBefore.userCPUTime - usageBefore.systemCPUTime) / 1000).toFixed(1)} ms CPU on all threads; ` +
+        `hypervisor steal across the window: ${stealMs === null ? 'unknown (no /proc/stat)' : `${stealMs} ms`}` +
+        `${attempts.length > 1 ? ` (attempt ${attempts.length} of 5; steal per attempt: ${attempts.map((a) => `${a.stealMs} ms`).join(', ')})` : ''}`,
+    ).toBeLessThan(100);
   });
 
   test('quiet mode emits nothing', () => {
@@ -233,6 +379,42 @@ describe('progress reporter', () => {
     // After 50 reporter lifecycles, still exactly one handler and no new live entries.
     expect(__signalHandlerInstalledForTest()).toBe(installedBefore || true);
     expect(__liveReporterCountForTest()).toBe(liveBefore);
+  });
+
+  test('SIGINT exits a child process when the progress reporter is the only handler', async () => {
+    const result = await runSigintHarness(`
+      const { createProgress } = await import('./src/core/progress.ts');
+      const progress = createProgress({ mode: 'json' });
+      progress.start('sigint_repro', 1);
+      process.stdout.write('READY\\n');
+      setInterval(() => {}, 1000);
+    `);
+
+    expect(result.exited).toBe(true);
+    expect(result.signal === 'SIGINT' || result.code === 130).toBe(true);
+    expect(result.stderr).toContain('"event":"abort"');
+    expect(result.stderr).toContain('"reason":"SIGINT"');
+  });
+
+  test('SIGINT still defers to another process handler when one is installed', async () => {
+    const result = await runSigintHarness(`
+      const { createProgress } = await import('./src/core/progress.ts');
+      process.once('SIGINT', () => {
+        process.stdout.write('HANDLED\\n');
+        setTimeout(() => process.exit(0), 50);
+      });
+      const progress = createProgress({ mode: 'json' });
+      progress.start('sigint_repro', 1);
+      process.stdout.write('READY\\n');
+      setInterval(() => {}, 1000);
+    `);
+
+    expect(result.exited).toBe(true);
+    expect(result.code).toBe(0);
+    expect(result.signal).toBeNull();
+    expect(result.stdout).toContain('HANDLED');
+    expect(result.stderr).toContain('"event":"abort"');
+    expect(result.stderr).toContain('"reason":"SIGINT"');
   });
 
   test('startHeartbeat() fires heartbeats and stop() clears', async () => {

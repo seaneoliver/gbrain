@@ -31,6 +31,10 @@
 
 set -euo pipefail
 
+# #3485: shared name floor — these scripts mutate whatever DATABASE_URL names
+# and are documented for direct invocation, so each sources the floor itself.
+source "$(dirname "$0")/_db_floor.sh"
+
 cd "$(dirname "$0")/../.."
 
 WALLCLOCK_BUDGET_S="${WALLCLOCK_BUDGET_S:-15}"
@@ -83,7 +87,7 @@ echo "[fm_wallclock] fixture seeded in ${SEED_ELAPSED}s" | tee -a "$LOG"
 # Step 2: init brain + register the source.
 # `--no-embedding` opts out of the embedding-provider hard-require (v0.37 D9).
 # This script measures doctor's frontmatter-scan wallclock — it never embeds —
-# so the CI runner doesn't need OPENAI_API_KEY / ZEROENTROPY_API_KEY / VOYAGE_API_KEY.
+# so the CI runner doesn't need OPENAI_API_KEY / VOYAGE_API_KEY.
 echo "[fm_wallclock] init brain..." | tee -a "$LOG"
 timeout 120s bun run src/cli.ts init --pglite --non-interactive --no-embedding >> "$LOG" 2>&1 || {
   echo "[fm_wallclock] FAIL: gbrain init exited non-zero" >&2
@@ -98,8 +102,8 @@ timeout 120s bun run src/cli.ts init --pglite --non-interactive --no-embedding >
 # unknown script name and dumps its usage/script listing with exit 0, so the
 # INSERT silently never ran and doctor scanned zero sources (vacuous pass).
 # Resolve the engine the same way the CLI does (config + env), so the source
-# lands in the DB doctor actually reads (Postgres when CI sets DATABASE_URL,
-# the PGLite brain otherwise) — a hardcoded `connect({})` is in-memory and
+# lands in the DB doctor actually reads (the isolated PGLite brain initialized
+# above) — a hardcoded `connect({})` is in-memory and
 # the INSERT would vanish.
 echo "[fm_wallclock] register source..." | tee -a "$LOG"
 bun -e "
